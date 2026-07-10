@@ -1,0 +1,21 @@
+{
+  "name": "chatbot-whatsapp-dpvat",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Cérebro de IA do atendimento WhatsApp do DPVAT Paraná. Recebe a mensagem do cliente (encaminhada pelo app Next) e decide: responder ou escalar para atendente humano.",
+  "main": "index.js",
+  "scripts": {
+    "start": "node index.js",
+    "dev": "node index.js"
+  },
+  "engines": {
+    "node": ">=18.18"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.110.0",
+    "@google/genai": "^2.10.0",
+    "@google/generative-ai": "^0.24.1",
+    "dotenv": "^16.4.7",
+    "express": "^5.2.1"
+  }
+}
