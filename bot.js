@@ -103,10 +103,14 @@ const responseSchema = {
         urgent: { type: "boolean" },
         understood: { type: "boolean" },
         confidence: { type: "number" },
+        optOut: {
+            type: "boolean",
+            description: "true SOMENTE se o cliente pediu CLARAMENTE, pelo contexto, para PARAR de receber mensagens/ser descadastrado (ex.: 'não quero mais receber', 'me tira dessa lista', 'para de me mandar mensagem'). NÃO marque true quando 'sair'/'parar' aparecem em outro sentido (ex.: 'vou precisar sair, mas já volto', 'quero sair da fila do INSS', 'pode parar de me ligar' — ligação não é WhatsApp). Na dúvida, deixe false.",
+        },
     },
     required: [
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
-        "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence",
+        "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence", "optOut",
     ],
 };
 
@@ -176,6 +180,27 @@ não como obrigatórios em toda resposta. Mensagens seguidas com emoji em todas
 soam artificiais e cansam o cliente.
 
 ${nome ? `O cliente se chama ${nome}.` : "Você ainda não sabe o nome do cliente."}
+
+═══════════════════════════════════════
+REGRAS ANTI-SPAM (OBRIGATÓRIAS — a conta pode ser punida pela Meta):
+═══════════════════════════════════════
+
+- NUNCA repita uma mensagem que você já enviou. Se você já cumprimentou ou já
+  ofereceu ajuda e o cliente ainda não respondeu de forma clara, NÃO reenvie a
+  mesma saudação/oferta — apenas reformule de forma breve UMA vez, ou aguarde.
+- Olhe o HISTÓRICO: se a sua última mensagem já foi uma saudação/oferta, não
+  mande outra igual. Reenviar a mesma coisa várias vezes é tratado como SPAM.
+- DESCADASTRO (optOut): marque o campo optOut=true SOMENTE quando o cliente
+  pedir CLARAMENTE, PELO CONTEXTO, para parar de receber suas mensagens. Ex.
+  reais de opt-out: "não quero mais receber", "me tira dessa lista", "para de
+  me mandar mensagem", "não me manda mais nada". Nesses casos: optOut=true,
+  action="disqualify", state="encerrando", reply=despedida curta e respeitosa.
+  ATENÇÃO — NÃO é opt-out (deixe optOut=false) quando a palavra aparece em outro
+  sentido, por exemplo: "vou precisar sair, mas já volto", "quero sair da fila
+  do INSS", "pode parar de me ligar" (ligação ≠ WhatsApp), "parar o processo".
+  Julgue pela INTENÇÃO na conversa, não pela palavra isolada. Na dúvida, false.
+- Não envie sequências longas de mensagens sem o cliente pedir. Prefira poucas
+  mensagens e sempre com propósito.
 
 ═══════════════════════════════════════
 COMO USAR O CAMPO "state" (OBRIGATÓRIO):
@@ -636,6 +661,7 @@ async function decide({
         urgent: Boolean(parsed.urgent),
         understood: parsed.understood !== false,
         confidence: Math.min(Math.max(Number(parsed.confidence ?? 0.8), 0), 1),
+        optOut: Boolean(parsed.optOut),
     };
 }
 
