@@ -1,19 +1,10 @@
-// Chatbot WhatsApp — DPVAT Paraná
-//
-// Microserviço "cérebro" do atendimento: o app Next (Vercel) recebe o webhook
-// da Meta, grava a mensagem no banco e, se a conversa estiver em modo bot,
-// chama POST /reply aqui. Este serviço só roda a IA e devolve a decisão —
-// quem envia pro WhatsApp, persiste memória/estado e notifica é o app Next.
-//
-// Mesmo padrão de deploy do docx-converter: Node no Railway, 1 instância.
-
 require("dotenv").config();
 const express = require("express");
-const { decide } = require("./bot");
+const { decide, farewell } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
-app.use(express.json({ limit: "2mb" }));
+app.use(express.json({ limit: "10mb" }));
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "chatbot-whatsapp", model: process.env.MODEL || "claude-opus-4-8" });
@@ -24,8 +15,6 @@ app.get("/health", (_req, res) => {
 // Resposta: { reply, action, handoffReason?, lookup?, memory, state, intent,
 //             emotion, urgent, understood, confidence }
 app.post("/reply", async (req, res) => {
-  console.log("req.body", req.body);
-  
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
   }
@@ -55,12 +44,31 @@ app.post("/reply", async (req, res) => {
       (decision.lookup ? ` lookup=${decision.lookup}` : "") +
       (decision.handoffReason ? ` (${decision.handoffReason})` : ""),
     );
+    console.log("[BOT COMPLETO]:", decision); 
     res.json(decision);
   } catch (err) {
     console.error("[BOT] Erro na IA:", err);
     // Falha da IA → o app Next joga na fila humana SEM mandar mensagem de
     // erro pro cliente. Um erro aqui nunca deixa o cliente falando sozinho.
     res.status(500).json({ error: "ia_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Despedida contextual do encerramento por inatividade (cron do app Next).
+// Body: { contact, history, memory } → { farewell }
+app.post("/farewell", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory } = req.body || {};
+  try {
+    const text = await farewell({ contact, history, memory });
+    console.log(`[BOT] farewell para ${contact?.name ?? "?"}: ${text.slice(0, 80)}...`);
+    res.json({ farewell: text });
+  } catch (err) {
+    console.error("[BOT] Erro na despedida:", err);
+    // O app Next tem fallback de texto fixo — só sinalizamos o erro.
+    res.status(500).json({ error: "farewell_error", detail: String(err?.message ?? err) });
   }
 });
 

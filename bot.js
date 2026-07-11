@@ -633,4 +633,45 @@ async function decide({
     };
 }
 
-module.exports = { decide };
+// ---------------------------------------------------------------------------
+// Despedida contextual por inatividade (chamada pelo cron do app Next).
+// Gera um fecho curto e cordial RESUMINDO o que foi tratado na conversa.
+// Chamada barata (sem structured output, poucos tokens) — o app tem fallback
+// de texto fixo se isto falhar.
+// ---------------------------------------------------------------------------
+async function farewell({ contact, history, memory }) {
+    const model = process.env.MODEL || "claude-opus-4-8";
+
+    const transcript = (Array.isArray(history) ? history : [])
+        .slice(-20)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 300,
+        system: [
+            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "O cliente parou de responder há mais de 40 minutos e o atendimento será encerrado por inatividade.",
+            "Escreva UMA mensagem curta (2 a 4 frases) de despedida, formal porém calorosa, em português do Brasil:",
+            "- Mencione brevemente o assunto tratado (com base na conversa/ficha), sem repetir detalhes sensíveis (nunca cite CPF, endereço ou documentos).",
+            "- Diga que o atendimento está sendo encerrado por falta de retorno.",
+            "- Convide a pessoa a mandar mensagem a qualquer momento para continuar.",
+            "Responda SOMENTE com o texto da mensagem, sem aspas nem preâmbulo.",
+        ].join("\n"),
+        messages: [{
+            role: "user",
+            content:
+                `Nome do cliente: ${contact?.name ?? "não informado"}\n` +
+                (memory ? `Ficha da conversa: ${memory}\n` : "") +
+                (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
+        }],
+    });
+
+    const textBlock = response.content.find((b) => b.type === "text");
+    const text = String(textBlock?.text ?? "").trim();
+    if (!text) throw new Error("despedida vazia");
+    return text;
+}
+
+module.exports = { decide, farewell };
