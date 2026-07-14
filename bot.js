@@ -10,6 +10,17 @@
 // pelo campo "state" (enum fechado) e existe critério de saída obrigatório —
 // no máximo 2 tentativas de contornar objeção; depois disso o bot DECIDE
 // (qualify ou disqualify). Nunca fica preso "conduzindo" para sempre.
+//
+// PROMPT CACHING: o system prompt é dividido em dois blocos — o ESTÁTICO
+// (todas as instruções/roteiro, idêntico em toda chamada, marcado com
+// cache_control) e o DINÂMICO (nome, dados do sistema, ficha, etapa, fluxos).
+// O bloco estático é ~90% do input; com o cache da Anthropic ele é lido a
+// custo de cache-read (10% do preço) em toda mensagem dentro do TTL de 5min.
+//
+// PODA POR ORÇAMENTO DE TOKENS: o histórico e a memória não entram mais "no
+// bruto" — cada mensagem do histórico é clipada e o total respeita um budget;
+// a ficha (memory) acima do limite é COMPACTADA por um modelo pequeno antes de
+// entrar no prompt (os fatos não se perdem — são reescritos de forma densa).
 
 const Anthropic = require("@anthropic-ai/sdk");
 const { GoogleGenAI } = require("@google/genai");
@@ -24,6 +35,74 @@ const genAI = process.env.GOOGLE_API_KEY
     : null;
 
 const MAX_AUDIO_BYTES = 18 * 1024 * 1024;
+
+// ---------------------------------------------------------------------------
+// Orçamento de tokens (estimativa ~3.5 chars/token para pt-BR)
+// ---------------------------------------------------------------------------
+const HISTORY_TOKEN_BUDGET = 1800; // teto do histórico dentro do prompt
+const HISTORY_MSG_MAX_CHARS = 600; // uma mensagem gigante não come o budget todo
+const MEMORY_SOFT_CHARS = 2600;    // acima disto a ficha é compactada pela IA
+const MEMORY_HARD_CHARS = 4000;    // teto absoluto (fallback se a compactação falhar)
+
+function estTokens(text) {
+    return Math.ceil((text?.length ?? 0) / 3.5);
+}
+
+function clipText(text, max) {
+    if (!text || text.length <= max) return text;
+    return text.slice(0, max) + " […]";
+}
+
+/**
+ * Poda o histórico por orçamento de tokens: anda do MAIS NOVO para o mais
+ * antigo somando tokens estimados e corta quando estoura o budget. Cada
+ * mensagem individual também é clipada (HISTORY_MSG_MAX_CHARS).
+ */
+function pruneHistory(history, budget = HISTORY_TOKEN_BUDGET) {
+    const out = [];
+    let used = 0;
+    for (let i = history.length - 1; i >= 0; i--) {
+        const h = history[i];
+        const text = clipText(String(h.text ?? ""), HISTORY_MSG_MAX_CHARS);
+        if (!text) continue;
+        const cost = estTokens(text) + 4; // overhead por turno
+        if (used + cost > budget && out.length > 0) break;
+        used += cost;
+        out.unshift({ ...h, text });
+    }
+    return out;
+}
+
+/**
+ * Ficha (memory) acima do limite → compacta com um modelo pequeno, mantendo
+ * TODOS os fatos (reescritos de forma densa, uma linha por fato). O resultado
+ * compactado volta no campo `memory` da resposta e é PERSISTIDO pelo app Next,
+ * então a compactação acontece no máximo uma vez por "estouro".
+ */
+async function compactMemory(memory) {
+    const model = process.env.MODEL_SMALL || "claude-haiku-4-5-20251001";
+    try {
+        const response = await anthropic.messages.create({
+            model,
+            max_tokens: 700,
+            system:
+                "Você compacta fichas de atendimento de WhatsApp. Reescreva a ficha " +
+                "abaixo preservando TODOS os fatos objetivos (nome, cidade, datas, " +
+                "acidente, lesões, INSS, decisões, pendências), uma linha por fato, " +
+                "sem comentários nem repetições. Máximo de 1200 caracteres. " +
+                "Responda SOMENTE com a ficha compactada.",
+            messages: [{ role: "user", content: memory }],
+        });
+        const text = response.content.find((b) => b.type === "text")?.text?.trim();
+        if (text) {
+            console.log(`[BOT] Ficha compactada: ${memory.length} → ${text.length} chars.`);
+            return text;
+        }
+    } catch (err) {
+        console.warn("[BOT] Compactação da ficha falhou (usando corte duro):", err.message);
+    }
+    return memory.slice(0, MEMORY_HARD_CHARS);
+}
 
 // ---------------------------------------------------------------------------
 // Estados da conversa (enum fechado — é assim que o roteiro não se perde)
@@ -157,29 +236,30 @@ function validationNotes(text) {
 }
 
 // ---------------------------------------------------------------------------
-// System Prompt — roteiro de vendas mantido, com rastreamento de etapa e
-// critério de saída obrigatório (fim do loop infinito).
+// System Prompt — BLOCO ESTÁTICO (idêntico em toda chamada → prompt caching).
+//
+// Regra de ouro desta constante: NADA dinâmico aqui dentro. Nome do cliente,
+// dados do sistema, ficha, etapa, fluxos e horário entram no bloco DINÂMICO
+// (buildDynamicContext). Nos exemplos, "[nome]" e "[saudação do horário]" são
+// placeholders que a IA substitui pelos valores do bloco de dados.
 // ---------------------------------------------------------------------------
-function buildSystemPrompt({ contact, processInfo, memory, state, failCount, business, flows }) {
-    const nome = contact?.name ? contact.name.split(" ")[0] : null;
-
-    // Fluxos cadastrados (nome + descrição) que a IA pode disparar via send_flow.
-    const flowsList = Array.isArray(flows) && flows.length
-        ? flows.map((f) => `- "${f.name}": ${f.description}`).join("\n")
-        : "(nenhum fluxo cadastrado)";
-
-    return `
+const STATIC_SYSTEM_PROMPT = `
 Você é a assistente virtual de um escritório que ajuda vítimas de acidente a
 conseguir o AUXÍLIO-ACIDENTE do INSS. Você conversa com CLIENTES pelo WhatsApp.
 Seja humana, calorosa e natural — nunca robótica. Mensagens CURTAS (é WhatsApp).
+
+Ao final destas instruções há um bloco "DADOS DA CONVERSA" com: o nome do
+cliente (se conhecido), os dados do sistema, a ficha de fatos, a etapa atual,
+os fluxos disponíveis e o horário. Nos exemplos abaixo, substitua "[nome]"
+pelo nome do cliente (só o primeiro nome) e "[saudação do horário]" pela
+saudação indicada nos dados (bom dia / boa tarde / boa noite). Se você ainda
+não sabe o nome, cumprimente sem ele.
 
 EMOJI — USE COM MODERAÇÃO: no máximo 1 emoji a cada 2-3 mensagens, nunca mais
 de um emoji na MESMA mensagem. A maioria das suas respostas deve sair SEM
 nenhum emoji — trate os emojis dos exemplos abaixo como opcionais/ilustrativos,
 não como obrigatórios em toda resposta. Mensagens seguidas com emoji em todas
 soam artificiais e cansam o cliente.
-
-${nome ? `O cliente se chama ${nome}.` : "Você ainda não sabe o nome do cliente."}
 
 ═══════════════════════════════════════
 REGRAS ANTI-SPAM (OBRIGATÓRIAS — a conta pode ser punida pela Meta):
@@ -208,7 +288,7 @@ COMO USAR O CAMPO "state" (OBRIGATÓRIO):
 
 O campo "state" rastreia EXATAMENTE onde a conversa está. Etapas, em ordem:
 
-1. saudacao             → cumprimente o cliente pelo nome (se souber) ("Olá, ${nome ?? "[nome]"}! Como o que eu posso te ajudar ?")
+1. saudacao             → cumprimente o cliente pelo nome (se souber) ("Olá, [nome]! Como o que eu posso te ajudar ?")
 2. coleta_nome          → Somente se não souber o nome do cliente, pergunte ("Como posso te chamar?"). NÃO peça outros dados pessoais.
 3. triagem_quando_onde  → "1️⃣ Quando e onde foi o acidente?"
 4. triagem_lesao        → "2️⃣ O que você machucou?"
@@ -223,9 +303,9 @@ O campo "state" rastreia EXATAMENTE onde a conversa está. Etapas, em ordem:
 13. contornando_objecao_2 → 2ª (e ÚLTIMA) tentativa
 14. encerrando          → decisão tomada (qualify/disqualify/handoff)
 
-REGRA DE OURO: olhe a ETAPA ATUAL (abaixo) e avance UMA etapa por resposta.
-Nunca repita uma etapa já concluída (os fatos já coletados estão na FICHA).
-EXCEÇÃO: ao QUALIFICAR o lead, você salta direto da triagem para
+REGRA DE OURO: olhe a ETAPA ATUAL (nos DADOS DA CONVERSA) e avance UMA etapa
+por resposta. Nunca repita uma etapa já concluída (os fatos já coletados estão
+na FICHA). EXCEÇÃO: ao QUALIFICAR o lead, você salta direto da triagem para
 "pergunta_interesse" disparando TODOS os blocos do roteiro comercial de uma
 vez pelo campo "replies" (ver CRITÉRIO DE QUALIFICAÇÃO).
 
@@ -233,20 +313,19 @@ vez pelo campo "replies" (ver CRITÉRIO DE QUALIFICAÇÃO).
 PRIORIDADE Nº 0 — O CLIENTE JÁ É CADASTRADO? (RETORNO)
 ═══════════════════════════════════════
 
-Olhe os DADOS DO SISTEMA (mais abaixo). Se o número JÁ ESTÁ VINCULADO A UM
-CADASTRO, este NÃO é um lead novo — é um CLIENTE EXISTENTE voltando a falar.
+Olhe os DADOS DO SISTEMA (no bloco de dados). Se o número JÁ ESTÁ VINCULADO A
+UM CADASTRO, este NÃO é um lead novo — é um CLIENTE EXISTENTE voltando a falar.
 Cada conversa começa do ZERO: o assunto anterior (encaminhamento, qualificação,
 triagem) já foi ENCERRADO. Você mantém APENAS o nome do cliente.
 
 Neste caso, IGNORE por completo o roteiro de vendas de lead novo (triagem de
 acidente, mensagens de benefício, honorários). Faça assim:
 
-- Na saudação / 1ª mensagem, CUMPRIMENTE pelo nome com a saudação do horário
-  ("${business?.greeting ?? "olá"}"), diga que viu que ele já tem cadastro, e
-  OFEREÇA verificar a situação do processo.
-  Ex.: "Olá, ${nome ?? "[nome]"}, ${business?.greeting ?? "olá"}! Vi aqui que
-  você já é nosso cliente. Gostaria que eu verificasse como está a situação do
-  seu processo?"
+- Na saudação / 1ª mensagem, CUMPRIMENTE pelo nome com a saudação do horário,
+  diga que viu que ele já tem cadastro, e OFEREÇA verificar a situação do
+  processo. Ex.: "Olá, [nome], [saudação do horário]! Vi aqui que você já é
+  nosso cliente. Gostaria que eu verificasse como está a situação do seu
+  processo?"
 - Se ele confirmar que quer saber do processo → action="lookup",
   lookup="status_processo", reply="" (veja "CONSULTA DE STATUS DO PROCESSO"
   abaixo para como responder: mensagem formatada OU disparar um fluxo).
@@ -283,8 +362,7 @@ Após as 3 respostas da triagem, analise se existe possibilidade de
 Auxílio-Acidente. Sinais positivos:
 - Acidente de qualquer natureza  (de trânsito, de trabalho, doméstico ou até de lazer)
 - Houve lesão, com fratura, que trouxe incapacidade laboral, mesmo que com sequela mínima e parcial!
-- Houve afastamento pelo INSS, recebeu auxílio a época do acidente!
-Ou caso tenha trabalhado com registro em carteira de trabalho até 12 meses antes do acidente, pode ter direito a receber o auxílio Acidente!
+- Houve afastamento pelo INSS, recebeu auxílio a época do acidente! Ou caso tenha trabalhado com registro em carteira de trabalho até 12 meses antes do acidente, pode ter direito a receber o auxílio Acidente!
 - Caso o Acidente tenha ocorrido nos últimos 20 anos (apartir de 2006) existe a possibilidade de trabalharmos na ação!
 
 Se o caso parecer compatível: NÃO peça mais informações, NÃO faça novas
@@ -381,19 +459,13 @@ Explique com educação que provavelmente não se enquadra e marque
 action="disqualify", state="encerrando". Não transfira para atendente.
 
 ═══════════════════════════════════════
-DADOS DO SISTEMA (fonte única da verdade — NUNCA invente além disto):
-═══════════════════════════════════════
-${processInfo ? `- Cliente CADASTRADO no sistema.
-- Nome no cadastro: ${processInfo.name ?? "—"}
-- Etapa atual do processo: ${processInfo.etapa ?? "—"}
-- Tipo de serviço: ${processInfo.service ?? "—"}` : "- Este número NÃO está vinculado a nenhum cadastro."}
-
 CONSULTAS DISPONÍVEIS (action="lookup" + campo "lookup"):
+═══════════════════════════════════════
 - "status_processo": etapa e tipo de serviço do processo do cliente.
 - "dados_cadastro": se o número tem cadastro e o nome registrado.
 - "documentos_enviados": QUANTOS documentos o cliente já enviou (nunca o conteúdo).
 Use lookup quando o cliente perguntar algo que essas consultas respondem e o
-dado ainda não estiver acima. Com action="lookup", deixe reply="".
+dado ainda não estiver nos DADOS DO SISTEMA. Com action="lookup", deixe reply="".
 
 ═══════════════════════════════════════
 CONSULTA DE STATUS DO PROCESSO (cliente cadastrado):
@@ -405,7 +477,7 @@ lookup="status_processo", reply="". Ao receber o RESULTADO DA CONSULTA:
 1. Se encontrou (encontrado=true), você tem a ETAPA e o SERVIÇO. Então escolha:
    a) RESPOSTA FORMATADA: uma mensagem curta, calorosa e clara com a etapa
       atual. Ex.:
-      "Prontinho, ${nome ?? "[nome]"}! Seu processo (${processInfo?.service ?? "—"}) está atualmente na etapa: *[etapa]*.
+      "Prontinho, [nome]! Seu processo ([serviço]) está atualmente na etapa: *[etapa]*.
       Assim que houver uma nova atualização, a gente te avisa por aqui."
    b) OU, se houver um FLUXO cadastrado cuja DESCRIÇÃO se encaixa melhor nessa
       etapa/situação, dispare-o: action="send_flow", flowName="<nome exato>".
@@ -423,12 +495,12 @@ lookup="status_processo", reply="". Ao receber o RESULTADO DA CONSULTA:
 ═══════════════════════════════════════
 FLUXOS DISPONÍVEIS (você pode disparar com action="send_flow" + flowName):
 ═══════════════════════════════════════
-${flowsList}
 
-Cada fluxo tem uma DESCRIÇÃO que diz PARA QUAL SITUAÇÃO ele serve. Quando a
-situação do cliente se encaixar numa descrição, você pode disparar o fluxo com
-action="send_flow" e flowName EXATAMENTE igual ao nome listado. Se nenhum
-fluxo se encaixa, responda normalmente por texto.
+A lista de fluxos cadastrados está nos DADOS DA CONVERSA. Cada fluxo tem uma
+DESCRIÇÃO que diz PARA QUAL SITUAÇÃO ele serve. Quando a situação do cliente
+se encaixar numa descrição, você pode disparar o fluxo com action="send_flow"
+e flowName EXATAMENTE igual ao nome listado. Se nenhum fluxo se encaixa,
+responda normalmente por texto.
 
 ═══════════════════════════════════════
 CATEGORIAS DE ENCERRAMENTO (campo closeCategory):
@@ -456,15 +528,12 @@ O QUE VOCÊ NUNCA PODE FAZER:
 - NUNCA dê aconselhamento jurídico específico — papel do time humano.
 
 ═══════════════════════════════════════
-FICHA E ETAPA ATUAL (não pergunte o que já sabe!):
+FICHA (memory):
 ═══════════════════════════════════════
-FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
-${memory || "(vazia — conversa nova)"}
 
-ETAPA ATUAL DA CONVERSA: ${state || "saudacao"}
-
-Em TODA resposta, devolva no campo "memory" a ficha COMPLETA atualizada
-(copie os fatos antigos e acrescente os novos).
+A FICHA ATUAL (fatos já coletados) está nos DADOS DA CONVERSA — NUNCA pergunte
+de novo o que já está nela. Em TODA resposta, devolva no campo "memory" a
+ficha COMPLETA atualizada (copie os fatos antigos e acrescente os novos).
 
 ═══════════════════════════════════════
 REGRAS IMPORTANTES:
@@ -480,14 +549,62 @@ REGRAS IMPORTANTES:
 - WhatsApp: mensagens curtas.
 - RESPOSTAS CURTAS do cliente ("sim", "isso", "aham") = confirmação do que você perguntou.
 - Se não entendeu a mensagem, understood=false e peça com jeito para repetir.
-  Tentativas seguidas sem entender até agora: ${failCount || 0}.
-${business && !business.open ? `- HORÁRIO: estamos FORA do horário comercial. Faça a triagem normalmente,
-  mas ao transferir avise: "Nossa equipe responderá ${business.reopens}."` : ""}
+  (O número de tentativas seguidas sem entender está nos DADOS DA CONVERSA.)
 `.trim();
+
+// ---------------------------------------------------------------------------
+// Bloco DINÂMICO do system prompt — tudo que muda por conversa/mensagem.
+// ---------------------------------------------------------------------------
+function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows }) {
+    const nome = contact?.name ? contact.name.split(" ")[0] : null;
+
+    const flowsList = Array.isArray(flows) && flows.length
+        ? flows.map((f) => `- "${f.name}": ${f.description}`).join("\n")
+        : "(nenhum fluxo cadastrado)";
+
+    return `
+═══════════════════════════════════════
+DADOS DA CONVERSA (fonte única da verdade — NUNCA invente além disto):
+═══════════════════════════════════════
+
+NOME DO CLIENTE: ${nome ?? "(ainda não informado — você não sabe o nome)"}
+SAUDAÇÃO DO HORÁRIO: ${business?.greeting ?? "olá"}
+
+DADOS DO SISTEMA:
+${processInfo ? `- Cliente CADASTRADO no sistema.
+- Nome no cadastro: ${processInfo.name ?? "—"}
+- Etapa atual do processo: ${processInfo.etapa ?? "—"}
+- Tipo de serviço: ${processInfo.service ?? "—"}` : "- Este número NÃO está vinculado a nenhum cadastro."}
+
+FLUXOS DISPONÍVEIS:
+${flowsList}
+
+FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
+${memory || "(vazia — conversa nova)"}
+
+ETAPA ATUAL DA CONVERSA: ${state || "saudacao"}
+
+Tentativas seguidas sem entender até agora: ${failCount || 0}.
+${business && !business.open ? `HORÁRIO: estamos FORA do horário comercial. Faça a triagem normalmente,
+mas ao transferir avise: "Nossa equipe responderá ${business.reopens}."` : ""}
+`.trim();
+}
+
+/**
+ * Monta o array `system` com o bloco estático CACHEADO (cache_control) e o
+ * bloco dinâmico por fora do cache. O dashboard já lê cacheReadTokens do
+ * usage — com isto ele passa a mostrar leitura de cache de verdade.
+ */
+function buildSystemBlocks(params) {
+    return [
+        { type: "text", text: STATIC_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+        { type: "text", text: buildDynamicContext(params) },
+    ];
 }
 
 // ---------------------------------------------------------------------------
 // Áudio: Claude não aceita áudio — transcreve no Gemini e usa como texto.
+// (Também exposto no endpoint /transcribe para o botão "transcrever" do inbox.)
 // ---------------------------------------------------------------------------
 async function transcribeAudio(media) {
     if (!media?.url || !media?.mimeType) return null;
@@ -513,6 +630,21 @@ async function transcribeAudio(media) {
         ? response.text
         : response.candidates?.[0]?.content?.parts?.[0]?.text;
     return (text ?? "").trim() || null;
+}
+
+// ---------------------------------------------------------------------------
+// Uso de tokens (comum a todas as chamadas)
+// ---------------------------------------------------------------------------
+function usageFrom(response, model) {
+    return response.usage
+        ? {
+            model,
+            inputTokens: response.usage.input_tokens ?? 0,
+            outputTokens: response.usage.output_tokens ?? 0,
+            cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
+            cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
+        }
+        : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -558,6 +690,12 @@ async function decide({
         effHistory = [];
     }
 
+    // Ficha estourou o limite? Compacta ANTES de montar o prompt (o resultado
+    // volta em `memory` e o app Next persiste — compacta 1x por estouro).
+    if (effMemory && effMemory.length > MEMORY_SOFT_CHARS) {
+        effMemory = await compactMemory(effMemory);
+    }
+
     // Áudio → transcrição via Gemini. Se falhar, devolve "não entendi"
     // (o app Next cuida do failCount e do handoff após 2 falhas).
     let clientText = message;
@@ -589,7 +727,8 @@ async function decide({
     }
 
     // Histórico no formato do Claude: cliente = user; bot/atendente = assistant.
-    const messages = effHistory.slice(-30).map((h) => ({
+    // Poda por orçamento de tokens (mais recente primeiro) + clip por mensagem.
+    const messages = pruneHistory(effHistory).map((h) => ({
         role: h.role === "client" ? "user" : "assistant",
         content: h.role === "agent" ? `[atendente humano] ${h.text}` : h.text,
     })).filter((m) => m.content);
@@ -601,18 +740,16 @@ async function decide({
         parts.push(`RESULTADO DA CONSULTA QUE VOCÊ PEDIU (${lookupResult.kind}):\n${JSON.stringify(lookupResult.data)}\nUse este resultado para responder AGORA (não peça a mesma consulta de novo).`);
     }
     messages.push({ role: "user", content: parts.join("\n\n") });
-    
 
     const response = await anthropic.messages.create({
         model,
         max_tokens: 8192,
-        system: buildSystemPrompt({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows }),
+        system: buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
         messages,
     });
-    console.log(JSON.stringify(messages).length);
     if (response.stop_reason === "refusal") {
         // Segurança do modelo recusou — cai pra fila humana sem quebrar.
         throw new Error("modelo recusou a solicitação (refusal)");
@@ -631,15 +768,10 @@ async function decide({
 
     // Uso de tokens da chamada ao Claude — o app Next grava no log wa_bot e
     // calcula o gasto (semanal/mensal) no dashboard "Desempenho do Chatbot".
-    const usage = response.usage
-        ? {
-            model,
-            inputTokens: response.usage.input_tokens ?? 0,
-            outputTokens: response.usage.output_tokens ?? 0,
-            cacheReadTokens: response.usage.cache_read_input_tokens ?? 0,
-            cacheWriteTokens: response.usage.cache_creation_input_tokens ?? 0,
-        }
-        : null;
+    const usage = usageFrom(response, model);
+    if (usage) {
+        console.log(`[BOT] tokens: in=${usage.inputTokens} out=${usage.outputTokens} cacheRead=${usage.cacheReadTokens} cacheWrite=${usage.cacheWriteTokens}`);
+    }
 
     return {
         usage,
@@ -654,7 +786,7 @@ async function decide({
         closeCategory: parsed.closeCategory && parsed.closeCategory !== "nenhum" ? String(parsed.closeCategory) : null,
         handoffReason: parsed.handoffReason ? String(parsed.handoffReason) : undefined,
         lookup: parsed.lookup && parsed.lookup !== "nenhum" ? String(parsed.lookup) : null,
-        memory: String(parsed.memory ?? effMemory ?? "").slice(0, 4000),
+        memory: String(parsed.memory ?? effMemory ?? "").slice(0, MEMORY_HARD_CHARS),
         state: STATES.includes(parsed.state) ? parsed.state : String(effState ?? "saudacao"),
         intent: String(parsed.intent ?? "outro"),
         emotion: String(parsed.emotion ?? "neutro"),
@@ -663,6 +795,102 @@ async function decide({
         confidence: Math.min(Math.max(Number(parsed.confidence ?? 0.8), 0), 1),
         optOut: Boolean(parsed.optOut),
     };
+}
+
+// ---------------------------------------------------------------------------
+// SUGESTÃO DE RESPOSTA para o ATENDENTE HUMANO (agent-assist).
+// A IA propõe a próxima mensagem; o humano revisa, edita e envia.
+// ---------------------------------------------------------------------------
+async function suggest({ contact, processInfo, history = [], memory = null, agentName = null }) {
+    const model = process.env.MODEL || "claude-sonnet-5";
+    const nome = contact?.name ? contact.name.split(" ")[0] : null;
+
+    const transcript = pruneHistory(history, 2200)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 500,
+        system: [
+            {
+                type: "text",
+                text: [
+                    "Você é o assistente de um ATENDENTE HUMANO de um escritório que ajuda",
+                    "vítimas de acidente a conseguir o Auxílio-Acidente do INSS, num",
+                    "atendimento por WhatsApp. Sua tarefa: escrever a PRÓXIMA mensagem que o",
+                    "atendente deveria enviar ao cliente, com base na conversa e na ficha.",
+                    "",
+                    "Regras:",
+                    "- Escreva em português do Brasil, tom humano, caloroso e profissional.",
+                    "- Mensagem CURTA (é WhatsApp). No máximo 1 emoji, e só se fizer sentido.",
+                    "- Responda à ÚLTIMA mensagem do cliente; se houver pergunta pendente, responda-a.",
+                    "- NUNCA prometa prazos, ligações, valores ou aprovação do benefício.",
+                    "- NUNCA revele CPF, RG, endereço ou dados sensíveis.",
+                    "- NUNCA invente status do processo além do que está nos dados.",
+                    "- Não dê aconselhamento jurídico específico.",
+                    "- Responda SOMENTE com o texto da mensagem sugerida, sem aspas nem preâmbulo.",
+                ].join("\n"),
+                cache_control: { type: "ephemeral" },
+            },
+            {
+                type: "text",
+                text: [
+                    `Nome do cliente: ${nome ?? "não informado"}`,
+                    agentName ? `Nome do atendente: ${agentName}` : null,
+                    processInfo
+                        ? `Cadastro: SIM — nome ${processInfo.name ?? "—"}, etapa "${processInfo.etapa ?? "—"}", serviço ${processInfo.service ?? "—"}.`
+                        : "Cadastro: número sem vínculo no sistema.",
+                    memory ? `Ficha da conversa: ${clipText(memory, 1500)}` : null,
+                ].filter(Boolean).join("\n"),
+            },
+        ],
+        messages: [{
+            role: "user",
+            content: transcript
+                ? `Conversa até agora:\n${transcript}\n\nEscreva a próxima mensagem do atendente.`
+                : "Sem histórico disponível. Escreva uma mensagem inicial cordial do atendente.",
+        }],
+    });
+
+    const text = response.content.find((b) => b.type === "text")?.text?.trim();
+    if (!text) throw new Error("sugestão vazia");
+    return { suggestion: text, usage: usageFrom(response, model) };
+}
+
+// ---------------------------------------------------------------------------
+// RESUMO CURTO da conversa (vira comentário no card do kanban ao vincular).
+// ---------------------------------------------------------------------------
+async function summarize({ contact, history = [], memory = null }) {
+    const model = process.env.MODEL_SMALL || "claude-haiku-4-5-20251001";
+
+    const transcript = pruneHistory(history, 2600)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 400,
+        system: [
+            "Você resume conversas de WhatsApp de um escritório que atende vítimas de",
+            "acidente (Auxílio-Acidente do INSS). Escreva um resumo BEM CURTO em",
+            "português do Brasil, no máximo 5 linhas, formato de tópicos com '- '.",
+            "Cubra apenas o essencial: quem é o cliente, o que aconteceu (acidente/",
+            "lesão/INSS), o que foi decidido (qualificado? dúvida? documentos?) e",
+            "pendências. Sem CPF/RG/endereço. Responda SOMENTE com os tópicos.",
+        ].join("\n"),
+        messages: [{
+            role: "user",
+            content:
+                `Nome do cliente: ${contact?.name ?? "não informado"}\n` +
+                (memory ? `Ficha da conversa: ${clipText(memory, 1500)}\n` : "") +
+                (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
+        }],
+    });
+
+    const text = response.content.find((b) => b.type === "text")?.text?.trim();
+    if (!text) throw new Error("resumo vazio");
+    return { summary: text, usage: usageFrom(response, model) };
 }
 
 // ---------------------------------------------------------------------------
@@ -706,4 +934,4 @@ async function farewell({ contact, history, memory }) {
     return text;
 }
 
-module.exports = { decide, farewell };
+module.exports = { decide, farewell, suggest, summarize, transcribeAudio };

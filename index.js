@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell } = require("./bot");
+const { decide, farewell, suggest, summarize, transcribeAudio } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
@@ -69,6 +69,72 @@ app.post("/farewell", async (req, res) => {
     console.error("[BOT] Erro na despedida:", err);
     // O app Next tem fallback de texto fixo — só sinalizamos o erro.
     res.status(500).json({ error: "farewell_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Sugestão de resposta para o ATENDENTE HUMANO (agent-assist do inbox).
+// Body: { contact, processInfo, history, memory?, agentName? }
+// Resposta: { suggestion, usage }
+app.post("/suggest", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, processInfo, history, memory, agentName } = req.body || {};
+  try {
+    const out = await suggest({
+      contact,
+      processInfo: processInfo ?? null,
+      history: Array.isArray(history) ? history : [],
+      memory: memory ?? null,
+      agentName: agentName ?? null,
+    });
+    console.log(`[BOT] suggest para ${contact?.name ?? contact?.phone ?? "?"}: ${out.suggestion.slice(0, 80)}...`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BOT] Erro na sugestão:", err);
+    res.status(500).json({ error: "suggest_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Resumo BEM CURTO da conversa (vira comentário no card ao vincular contato).
+// Body: { contact, history, memory? } → { summary, usage }
+app.post("/summarize", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory } = req.body || {};
+  try {
+    const out = await summarize({
+      contact,
+      history: Array.isArray(history) ? history : [],
+      memory: memory ?? null,
+    });
+    console.log(`[BOT] summarize para ${contact?.name ?? contact?.phone ?? "?"} (${out.summary.length} chars).`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BOT] Erro no resumo:", err);
+    res.status(500).json({ error: "summarize_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Transcrição de áudio avulsa (botão "transcrever" do atendimento humano).
+// Body: { url, mimeType } → { transcript }  (url = pré-assinada do S3)
+app.post("/transcribe", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { url, mimeType } = req.body || {};
+  if (!url || !mimeType) {
+    return res.status(400).json({ error: "url e mimeType obrigatórios" });
+  }
+  try {
+    const transcript = await transcribeAudio({ url, mimeType });
+    if (!transcript) throw new Error("transcrição vazia");
+    console.log(`[BOT] transcribe ok (${transcript.length} chars).`);
+    res.json({ transcript });
+  } catch (err) {
+    console.error("[BOT] Erro na transcrição:", err);
+    res.status(500).json({ error: "transcribe_error", detail: String(err?.message ?? err) });
   }
 });
 
