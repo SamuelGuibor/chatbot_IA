@@ -80,7 +80,7 @@ function pruneHistory(history, budget = HISTORY_TOKEN_BUDGET) {
  * então a compactação acontece no máximo uma vez por "estouro".
  */
 async function compactMemory(memory) {
-    const model = process.env.MODEL_SMALL || "claude-haiku-4-5-20251001";
+    const model = process.env.MODEL_SMALL || "claude-haiku-4-5";
     try {
         const response = await anthropic.messages.create({
             model,
@@ -359,14 +359,42 @@ CRITÉRIO DE QUALIFICAÇÃO:
 ═══════════════════════════════════════
 
 Após as 3 respostas da triagem, analise se existe possibilidade de
-Auxílio-Acidente. Sinais positivos:
-- Acidente de qualquer natureza  (de trânsito, de trabalho, doméstico ou até de lazer)
-- Houve lesão, com fratura, que trouxe incapacidade laboral, mesmo que com sequela mínima e parcial!
-- Houve afastamento pelo INSS, recebeu auxílio a época do acidente! Ou caso tenha trabalhado com registro em carteira de trabalho até 12 meses antes do acidente, pode ter direito a receber o auxílio Acidente!
-- Caso o Acidente tenha ocorrido nos últimos 20 anos (apartir de 2006) existe a possibilidade de trabalharmos na ação!
+Auxílio-Acidente. Para QUALIFICAR, TODOS os requisitos abaixo precisam estar
+presentes — não basta um ou outro:
 
-Se o caso parecer compatível: NÃO peça mais informações, NÃO faça novas
-perguntas. O lead já está QUALIFICADO.
+R1. Houve acidente de qualquer natureza (de trânsito, de trabalho, doméstico
+    ou até de lazer), ocorrido nos últimos 20 anos (a partir de 2006).
+R2. Houve lesão com possível sequela/incapacidade, mesmo que mínima e parcial.
+R3. COBERTURA PELO INSS (requisito ELIMINATÓRIO — leia com atenção):
+    a) O cliente ficou afastado pelo INSS recebendo auxílio-doença na época
+       do acidente; OU
+    b) O cliente trabalhava com REGISTRO EM CARTEIRA (CLT) na época do
+       acidente ou até 12 meses antes dele.
+    Se NENHUMA das duas coisas aconteceu, o cliente NÃO se qualifica.
+
+⚠️ INTERPRETAÇÃO DA RESPOSTA DA PERGUNTA 3 (triagem_inss) — muitos clientes
+respondem de forma confusa, misturada ou incompleta. Analise o SENTIDO, não
+só as palavras:
+- "não fiquei", "não fiquei afastado", "não recebi nada", "nunca encostei"
+  → NÃO houve afastamento (R3a FALHOU). Isso NÃO qualifica sozinho, mas
+  ainda pode valer R3b — então PERGUNTE, ainda em state="triagem_inss":
+  "Entendi. E na época do acidente você trabalhava registrado em carteira,
+  ou tinha trabalhado registrado nos 12 meses antes?"
+- "autônomo", "por conta própria", "sem carteira", "informal", "bico",
+  "freelancer", "fazia entregas por fora" → indica que NÃO era registrado
+  (R3b provavelmente FALHOU). Se ele também não ficou afastado, NÃO
+  QUALIFIQUE: confirme com a pergunta acima antes de decidir.
+- Resposta que mistura várias perguntas numa só (ex.: "Tornozelo, não fiquei,
+  trabalhava de motoboy autônomo") → separe cada pedaço: "tornozelo" responde
+  a lesão (pergunta 2), "não fiquei" responde o afastamento (NÃO ficou),
+  "autônomo" responde o vínculo (SEM carteira). Nesse exemplo R3a e R3b
+  falharam → NÃO qualifique.
+- Resposta ambígua ou que não deixa claro afastamento/vínculo → NÃO assuma
+  que sim. Faça UMA pergunta de esclarecimento (permanecendo em
+  state="triagem_inss") antes de qualificar ou desqualificar.
+
+Somente se R1 + R2 + R3 estiverem confirmados: NÃO peça mais informações,
+NÃO faça novas perguntas. O lead já está QUALIFICADO.
 
 ⚠️ DISPARE O ROTEIRO COMERCIAL INTEIRO DE UMA VEZ (sem esperar o cliente
 responder entre as mensagens). Para isso, na MESMA resposta:
@@ -454,9 +482,18 @@ Se ficar claro que:
 - Não houve acidente.
 - Não teve nenhuma lesão.
 - Não existe qualquer possibilidade de sequela.
+- NÃO ficou afastado pelo INSS E NÃO trabalhava registrado em carteira na
+  época do acidente nem nos 12 meses anteriores (ex.: autônomo/informal sem
+  contribuição) — requisito R3 do critério de qualificação.
 
 Explique com educação que provavelmente não se enquadra e marque
 action="disqualify", state="encerrando". Não transfira para atendente.
+Exemplo de mensagem para o caso de falta de cobertura do INSS:
+"Entendi, [nome]. Infelizmente, como na época do acidente você não estava
+afastado pelo INSS e não trabalhava registrado em carteira, o seu caso não
+se enquadra nos requisitos do Auxílio-Acidente. Se você lembrar de algum
+período registrado próximo ao acidente, ou sofrer um novo acidente, pode
+falar com a gente que reanalisamos, combinado?"
 
 ═══════════════════════════════════════
 CONSULTAS DISPONÍVEIS (action="lookup" + campo "lookup"):
@@ -862,7 +899,7 @@ async function suggest({ contact, processInfo, history = [], memory = null, agen
 // RESUMO CURTO da conversa (vira comentário no card do kanban ao vincular).
 // ---------------------------------------------------------------------------
 async function summarize({ contact, history = [], memory = null }) {
-    const model = process.env.MODEL_SMALL || "claude-haiku-4-5-20251001";
+    const model = process.env.MODEL_SMALL || "claude-haiku-4-5";
 
     const transcript = pruneHistory(history, 2600)
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
