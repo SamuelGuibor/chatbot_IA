@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, suggest, summarize, transcribeAudio } = require("./bot");
+const { decide, farewell, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
@@ -135,6 +135,61 @@ app.post("/transcribe", async (req, res) => {
   } catch (err) {
     console.error("[BOT] Erro na transcrição:", err);
     res.status(500).json({ error: "transcribe_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// CÉREBRO passo A — extrai a lição de UMA revisão humana (chamado pelo CRM logo
+// que o supervisor salva o julgamento).
+// Body: { contact, history, memory?, review } → { lesson, states, section, usage }
+// lesson VAZIA é resposta válida: significa "não há nada novo a aprender aqui".
+app.post("/distill-lesson", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory, review } = req.body || {};
+  if (!review?.verdict) {
+    return res.status(400).json({ error: "review.verdict obrigatório" });
+  }
+  try {
+    const out = await distillLesson({
+      contact: contact ?? null,
+      history: Array.isArray(history) ? history : [],
+      memory: memory ?? null,
+      review,
+    });
+    console.log(
+      `[BRAIN] distill (${review.verdict}) → ` +
+      (out.lesson ? `"${out.lesson.slice(0, 80)}..." [${out.section}]` : "sem lição (nada novo)"),
+    );
+    res.json(out);
+  } catch (err) {
+    console.error("[BRAIN] Erro ao destilar lição:", err);
+    res.status(500).json({ error: "distill_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// CÉREBRO passo B — consolida as lições soltas no playbook (lote, sob demanda).
+// Body: { lessons: [...], current?, maxRules? }
+//   → { sections, rulesCount, changeNote, usage }
+app.post("/consolidate-playbook", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { lessons, current, maxRules } = req.body || {};
+  if (!Array.isArray(lessons) || !lessons.length) {
+    return res.status(400).json({ error: "lessons obrigatório (array não vazio)" });
+  }
+  try {
+    const out = await consolidatePlaybook({
+      lessons,
+      current: current ?? null,
+      maxRules: Number(maxRules) || 80,
+    });
+    console.log(`[BRAIN] consolidate: ${lessons.length} lições → ${out.rulesCount} regras. ${out.changeNote}`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BRAIN] Erro ao consolidar playbook:", err);
+    res.status(500).json({ error: "consolidate_error", detail: String(err?.message ?? err) });
   }
 });
 

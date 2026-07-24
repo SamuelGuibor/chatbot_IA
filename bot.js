@@ -684,9 +684,109 @@ mas ao transferir avise: "Nossa equipe responderá ${business.reopens}."` : ""}
  * bloco dinâmico por fora do cache. O dashboard já lê cacheReadTokens do
  * usage — com isto ele passa a mostrar leitura de cache de verdade.
  */
-function buildSystemBlocks(params) {
+// ---------------------------------------------------------------------------
+// CÉREBRO REMOTO — instruções e playbook vêm do CRM, não mais só do código.
+//
+// O CRM serve GET /api/whatsapp/brain-prompt (autenticado com o mesmo
+// BOT_SECRET) devolvendo:
+//   - instructions.rendered → as instruções base, editadas pela tela
+//   - playbook.sections     → as regras aprendidas das revisões humanas
+//
+// FALLBACK É A REGRA MAIS IMPORTANTE AQUI: se a rota cair, se o CRM estiver
+// fora do ar ou se ninguém tiver publicado nada ainda, usamos o
+// STATIC_SYSTEM_PROMPT hardcoded abaixo. Um bot com o prompt antigo atende
+// bem; um bot sem prompt nenhum conversa com o cliente sem identidade, sem
+// roteiro e sem as travas anti-spam da Meta.
+//
+// CACHE: o texto montado vira o bloco com cache_control. Como o cache da
+// Anthropic é casamento de prefixo byte a byte, este cache em memória é o que
+// garante que chamadas seguidas usem exatamente os mesmos bytes — sem ele,
+// buscar o prompt a cada mensagem arriscaria variação e derrubaria o cache
+// (10x mais caro no input). Só troca de fato quando alguém publica.
+// ---------------------------------------------------------------------------
+const BRAIN_URL = (process.env.BRAIN_PROMPT_URL || "").replace(/\/$/, "");
+// Mesmo segredo compartilhado que protege os endpoints deste serviço — no CRM
+// ele se chama CHATBOT_SECRET, aqui BOT_SECRET.
+const SECRET_FOR_BRAIN = process.env.BOT_SECRET || "";
+const BRAIN_TTL_MS = Number(process.env.BRAIN_TTL_MS || 5 * 60 * 1000);
+const BRAIN_TIMEOUT_MS = 8000;
+
+let brainCache = { text: null, fetchedAt: 0, version: null, playbookVersion: null };
+
+/** Formata as regras aprendidas como um bloco de texto para o prompt. */
+function renderPlaybook(playbook) {
+    if (!playbook?.sections?.length) return "";
+    const body = playbook.sections
+        .filter((s) => s.rules?.length)
+        .map((s) => {
+            const rules = s.rules.map((r) => `- ${r.text}`).join("\n");
+            return `${s.name}:\n${rules}`;
+        })
+        .join("\n\n");
+    if (!body) return "";
     return [
-        { type: "text", text: STATIC_SYSTEM_PROMPT, cache_control: { type: "ephemeral" } },
+        "═══════════════════════════════════════",
+        "LIÇÕES APRENDIDAS (revisões da equipe):",
+        "═══════════════════════════════════════",
+        "",
+        "Regras extraídas de atendimentos reais já revisados por um supervisor.",
+        "",
+        body,
+    ].join("\n");
+}
+
+async function fetchBrain() {
+    const res = await fetch(`${BRAIN_URL}/api/whatsapp/brain-prompt`, {
+        headers: { "x-bot-secret": SECRET_FOR_BRAIN },
+        signal: AbortSignal.timeout(BRAIN_TIMEOUT_MS),
+    });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return res.json();
+}
+
+/**
+ * Texto estático do system prompt: remoto quando disponível, hardcoded senão.
+ * Nunca lança — na dúvida devolve o fallback.
+ */
+async function getStaticPrompt() {
+    const fresh = Date.now() - brainCache.fetchedAt < BRAIN_TTL_MS;
+    if (brainCache.text && fresh) return brainCache.text;
+    if (!BRAIN_URL || !SECRET_FOR_BRAIN) return STATIC_SYSTEM_PROMPT;
+
+    try {
+        const data = await fetchBrain();
+        const base = data?.instructions?.rendered;
+        if (!base || typeof base !== "string" || base.length < 500) {
+            // Resposta sem instruções úteis: mantém o que já estava em memória
+            // (ou o fallback) e tenta de novo no próximo TTL.
+            throw new Error("instruções vazias ou curtas demais");
+        }
+        const text = [base, renderPlaybook(data.playbook)].filter(Boolean).join("\n\n");
+        brainCache = {
+            text,
+            fetchedAt: Date.now(),
+            version: data?.instructions?.version ?? null,
+            playbookVersion: data?.playbook?.version ?? null,
+        };
+        console.log(
+            `[BRAIN] prompt carregado do CRM: instruções v${brainCache.version}` +
+            (brainCache.playbookVersion ? `, playbook v${brainCache.playbookVersion} (${data.playbook.rulesCount} regras)` : ", sem playbook") +
+            ` — ${text.length} chars`,
+        );
+        return text;
+    } catch (err) {
+        console.error("[BRAIN] Falha ao buscar o prompt no CRM — usando o embutido:", err.message);
+        // Marca a tentativa para não martelar o CRM a cada mensagem quando ele
+        // estiver fora do ar; o texto em memória (se houver) continua valendo.
+        brainCache.fetchedAt = Date.now();
+        return brainCache.text || STATIC_SYSTEM_PROMPT;
+    }
+}
+
+async function buildSystemBlocks(params) {
+    const staticText = await getStaticPrompt();
+    return [
+        { type: "text", text: staticText, cache_control: { type: "ephemeral" } },
         { type: "text", text: buildDynamicContext(params) },
     ];
 }
@@ -833,7 +933,7 @@ async function decide({
     const response = await anthropic.messages.create({
         model,
         max_tokens: 8192,
-        system: buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows }),
+        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
@@ -1023,4 +1123,231 @@ async function farewell({ contact, history, memory }) {
     return text;
 }
 
-module.exports = { decide, farewell, suggest, summarize, transcribeAudio };
+// ---------------------------------------------------------------------------
+// CÉREBRO — PASSO A: extrair a LIÇÃO de uma revisão humana.
+//
+// Roda uma vez por revisão, logo que o humano salva o julgamento. Lê a conversa
+// + o veredito + o comentário + a resposta que o humano diria, e devolve UMA
+// lição curta e GENERALIZÁVEL.
+//
+// O ponto difícil (e o que o prompt mais cobra) é generalizar em vez de narrar:
+// "a Joisi teve que repetir a cidade" é inútil; "confira a ficha antes de
+// perguntar" vira regra. Também devolve os ESTADOS em que a lição se aplica —
+// é isso que depois permite buscar exemplos por estado, sem embeddings.
+//
+// Aprovação quase nunca gera lição: se a IA só fez o esperado, não há nada novo
+// a aprender e o playbook não deve inchar de obviedade. Por isso `lesson` pode
+// voltar vazia — é um resultado legítimo, não um erro.
+// ---------------------------------------------------------------------------
+const lessonSchema = {
+    type: "object",
+    properties: {
+        lesson: {
+            type: "string",
+            description:
+                "A lição em 1 ou 2 linhas, no imperativo e generalizável. String VAZIA quando não há nada novo a aprender.",
+        },
+        states: {
+            type: "array",
+            items: { type: "string" },
+            description: "Etapas da conversa em que a lição se aplica (ex.: triagem_seguro, coleta_cpf). Vazio se vale para qualquer etapa.",
+        },
+        section: {
+            type: "string",
+            enum: ["QUALIFICACAO", "CONTEXTO", "TOM", "INFORMACAO", "ENCAMINHAMENTO", "RITMO", "OUTRO"],
+            description: "Seção do playbook onde a lição se encaixa.",
+        },
+    },
+    required: ["lesson", "states", "section"],
+    additionalProperties: false,
+};
+
+async function distillLesson({ contact, history = [], memory = null, review }) {
+    const model = process.env.MODEL_DISTILL || "claude-sonnet-5";
+
+    const transcript = pruneHistory(history, 3000)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : h.role === "nota" ? "Nota interna" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 700,
+        system: [
+            "Você mantém o manual de conduta de um bot de WhatsApp que atende vítimas de",
+            "acidente (Auxílio-Acidente do INSS). Um supervisor humano acabou de julgar um",
+            "atendimento feito pelo bot. Sua tarefa é transformar esse julgamento em UMA",
+            "lição para o manual.",
+            "",
+            "REGRAS DA LIÇÃO:",
+            "- No máximo 2 linhas, em português do Brasil, no IMPERATIVO.",
+            "- GENERALIZE. Nunca cite o nome do cliente, a cidade, a data ou o caso concreto.",
+            "  Errado: 'A Joisi teve que repetir onde caiu.'",
+            "  Certo:  'Confira a ficha antes de perguntar: não repita pergunta cujo dado o cliente já deu.'",
+            "- Descreva o comportamento CORRETO a adotar, não apenas o erro cometido.",
+            "- Se o supervisor escreveu a resposta ideal, extraia dela o princípio, não o texto literal.",
+            "- Nada de CPF, RG, endereço ou valores específicos.",
+            "",
+            "QUANDO NÃO GERAR LIÇÃO (devolva lesson como string vazia):",
+            "- O veredito foi 'aprovado' e o bot apenas fez o esperado, sem nada notável.",
+            "- A lição seria genérica demais ('seja educado', 'ajude o cliente').",
+            "- O problema foi do cliente ou de sistema, não da condução do bot.",
+            "Uma lição óbvia é PIOR que nenhuma: ela dilui as regras que importam.",
+        ].join("\n"),
+        output_config: {
+            format: { type: "json_schema", schema: lessonSchema },
+        },
+        messages: [{
+            role: "user",
+            content:
+                `VEREDITO DO SUPERVISOR: ${review?.verdict ?? "não informado"}\n` +
+                (review?.errorTags?.length ? `PROBLEMAS MARCADOS: ${review.errorTags.join(", ")}\n` : "") +
+                (review?.comment ? `COMENTÁRIO DO SUPERVISOR: ${review.comment}\n` : "") +
+                (review?.correctReply ? `RESPOSTA QUE O SUPERVISOR DARIA: ${review.correctReply}\n` : "") +
+                (review?.botState ? `ETAPA EM QUE A CONVERSA TERMINOU: ${review.botState}\n` : "") +
+                (memory ? `FICHA MONTADA PELO BOT: ${clipText(memory, 1200)}\n` : "") +
+                `\nCONVERSA:\n${transcript || "(sem histórico)"}`,
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try {
+        out = JSON.parse(raw);
+    } catch {
+        throw new Error("resposta da destilação não é JSON válido");
+    }
+
+    return {
+        lesson: String(out.lesson ?? "").trim(),
+        states: Array.isArray(out.states) ? out.states.map(String) : [],
+        section: String(out.section ?? "OUTRO"),
+        usage: usageFrom(response, model),
+    };
+}
+
+// ---------------------------------------------------------------------------
+// CÉREBRO — PASSO B: consolidar as lições soltas num PLAYBOOK.
+//
+// Roda em lote (1x/dia ou sob demanda). Precisa ver TODAS as lições de uma vez:
+// é só olhando o conjunto que dá pra perceber que a lição nova é a mesma que já
+// existe e apenas incrementar o contador, em vez de virar a 41ª linha repetida.
+// É essa deduplicação que mantém o playbook pequeno enquanto as revisões crescem
+// sem limite.
+//
+// Usa o modelo mais forte de propósito: roda pouquíssimas vezes e o resultado
+// entra no prompt de TODA conversa — errar aqui custa muito mais caro do que a
+// diferença de preço da chamada.
+// ---------------------------------------------------------------------------
+const playbookSchema = {
+    type: "object",
+    properties: {
+        sections: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: {
+                    name: { type: "string" },
+                    rules: {
+                        type: "array",
+                        items: {
+                            type: "object",
+                            properties: {
+                                text: { type: "string", description: "A regra, no imperativo, 1-2 linhas." },
+                                weight: { type: "integer", description: "Quantas revisões sustentam esta regra." },
+                                states: { type: "array", items: { type: "string" } },
+                            },
+                            required: ["text", "weight", "states"],
+                            additionalProperties: false,
+                        },
+                    },
+                },
+                required: ["name", "rules"],
+                additionalProperties: false,
+            },
+        },
+        changeNote: {
+            type: "string",
+            description: "Resumo em 1-3 linhas do que mudou em relação ao playbook anterior.",
+        },
+    },
+    required: ["sections", "changeNote"],
+    additionalProperties: false,
+};
+
+async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80 }) {
+    const model = process.env.MODEL_PLAYBOOK || "claude-opus-4-8";
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 8000,
+        thinking: { type: "adaptive" },
+        system: [
+            "Você mantém o MANUAL DE CONDUTA de um bot de WhatsApp que atende vítimas de",
+            "acidente (Auxílio-Acidente do INSS). Recebe o manual atual e um lote de lições",
+            "novas, extraídas de revisões humanas de atendimentos reais. Devolva o manual",
+            "CONSOLIDADO.",
+            "",
+            "COMO CONSOLIDAR:",
+            "- Se uma lição nova diz o mesmo que uma regra existente, NÃO crie linha nova:",
+            "  some o peso (weight) da regra existente e, se couber, melhore a redação dela.",
+            "- Se duas regras se contradizem, mantenha a de MAIOR peso e descarte a outra.",
+            "- Se uma regra nova é um caso particular de outra mais geral, funda as duas.",
+            "- Ordene as regras de cada seção por peso, da maior para a menor.",
+            "",
+            `LIMITE RÍGIDO: no máximo ${maxRules} regras no total, somando todas as seções.`,
+            "Se estourar, descarte as de menor peso — este manual entra no prompt de TODA",
+            "conversa, e um manual inchado faz o modelo ignorar justamente as regras que",
+            "mais importam. Preferir poucas regras fortes a muitas regras fracas.",
+            "",
+            "ESTILO DE CADA REGRA: imperativo, 1 a 2 linhas, concreta e verificável.",
+            "Sem nome de cliente, sem caso concreto, sem dado sensível.",
+            "Descarte regras genéricas do tipo 'seja educado' — não acrescentam nada.",
+        ].join("\n"),
+        output_config: {
+            format: { type: "json_schema", schema: playbookSchema },
+        },
+        messages: [{
+            role: "user",
+            content:
+                (current
+                    ? `MANUAL ATUAL:\n${JSON.stringify(current, null, 2)}\n\n`
+                    : "MANUAL ATUAL: (ainda não existe — este é o primeiro)\n\n") +
+                `LIÇÕES NOVAS (${lessons.length}):\n` +
+                lessons
+                    .map((l, i) => `${i + 1}. [${l.section ?? "OUTRO"}] ${l.lesson}` +
+                        (l.states?.length ? ` (etapas: ${l.states.join(", ")})` : ""))
+                    .join("\n"),
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try {
+        out = JSON.parse(raw);
+    } catch {
+        throw new Error("resposta da consolidação não é JSON válido");
+    }
+
+    const sections = Array.isArray(out.sections) ? out.sections : [];
+    const rulesCount = sections.reduce((n, s) => n + (Array.isArray(s.rules) ? s.rules.length : 0), 0);
+
+    return {
+        sections,
+        rulesCount,
+        changeNote: String(out.changeNote ?? "").trim(),
+        usage: usageFrom(response, model),
+    };
+}
+
+module.exports = {
+    decide, farewell, suggest, summarize, transcribeAudio,
+    distillLesson, consolidatePlaybook,
+    // Exportado para diagnóstico: permite conferir de fora qual prompt o bot
+    // está usando (remoto do CRM ou o embutido de fallback) sem gastar uma
+    // chamada ao modelo.
+    getStaticPrompt,
+};
