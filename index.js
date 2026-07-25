@@ -19,7 +19,9 @@ app.post("/reply", async (req, res) => {
     return res.status(403).json({ error: "forbidden" });
   }
 
-  const { contact, processInfo, history, message, media, memory, state, failCount, business, lookupResult, flows } = req.body || {};
+  // priorOutcome ficava de fora do destructuring e era jogado fora — o prompt
+  // manda o modelo checar priorOutcome.qualified, mas o dado nunca chegava.
+  const { contact, processInfo, history, message, media, memory, state, failCount, business, lookupResult, flows, priorOutcome } = req.body || {};
   if ((!message || typeof message !== "string") && !media?.url) {
     return res.status(400).json({ error: "message ou media obrigatórios" });
   }
@@ -37,6 +39,7 @@ app.post("/reply", async (req, res) => {
       business: business ?? null,
       lookupResult: lookupResult ?? null,
       flows: Array.isArray(flows) ? flows : [],
+      priorOutcome: priorOutcome ?? null,
     });
     console.log(
       `[BOT] ${contact?.phone ?? "?"} → action=${decision.action} intent=${decision.intent}` +
@@ -44,7 +47,16 @@ app.post("/reply", async (req, res) => {
       (decision.lookup ? ` lookup=${decision.lookup}` : "") +
       (decision.handoffReason ? ` (${decision.handoffReason})` : ""),
     );
-    console.log("[BOT COMPLETO]:", decision); 
+    // NÃO logar `decision` inteira: `memory` é a ficha do cliente (pode conter
+    // CPF/endereço) — o próprio prompt proíbe expor esses dados; log não é
+    // exceção. Loga o resto + só o TAMANHO da ficha.
+    const { memory: _memory, reply: _reply, replies: _replies, ...meta } = decision;
+    console.log("[BOT COMPLETO]:", {
+      ...meta,
+      reply: String(_reply ?? "").slice(0, 120),
+      repliesCount: Array.isArray(_replies) ? _replies.length : 0,
+      memoryChars: String(_memory ?? "").length,
+    });
     res.json(decision);
   } catch (err) {
     console.error("[BOT] Erro na IA:", err);

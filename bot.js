@@ -366,6 +366,12 @@ SE priorOutcome.qualified === true  → NUNCA rodar triagem. Classificar a mensa
   • acidente DIFERENTE/novo → aí sim iniciar triagem só do caso novo → action: "continue"
   • ambíguo → "Você quer tirar uma dúvida ou dar entrada em um novo caso?" → action: "continue"
 
+SE o bloco ATENDIMENTO ANTERIOR existir (qualquer categoria, qualificado ou não):
+  é uma RETOMADA — NUNCA volte à saudação nem repita a triagem já feita (a ficha
+  tem os dados). Agradecimento/despedida/papo social após você já ter se despedido
+  → UMA frase curta sem pergunta, ou encerre em silêncio (silent=true).
+  Assunto NOVO de verdade → aí sim conduza a etapa adequada, aproveitando a ficha.
+
 Na primeira pergunta da triagem, introduza:
 
 "Quero ver se você tem direito a algum tipo de indenização.
@@ -656,7 +662,7 @@ REGRAS IMPORTANTES:
 // ---------------------------------------------------------------------------
 // Bloco DINÂMICO do system prompt — tudo que muda por conversa/mensagem.
 // ---------------------------------------------------------------------------
-function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows }) {
+function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows, priorOutcome }) {
     const nome = contact?.name ? contact.name.split(" ")[0] : null;
 
     const flowsList = Array.isArray(flows) && flows.length
@@ -680,6 +686,15 @@ ${processInfo ? `- Cliente CADASTRADO no sistema.
 FLUXOS DISPONÍVEIS:
 ${flowsList}
 
+${priorOutcome && (priorOutcome.closeCategory || priorOutcome.qualified != null) ? `ATENDIMENTO ANTERIOR (este contato JÁ FOI ATENDIDO e aquela conversa foi encerrada):
+- qualificado: ${priorOutcome.qualified === true ? "SIM" : priorOutcome.qualified === false ? "NÃO" : "—"}
+- categoria do encerramento: ${priorOutcome.closeCategory ?? "—"}
+Isto é uma RETOMADA, não um contato novo. NÃO recomece a saudação nem repita a
+triagem: use a FICHA e o histórico. Se a mensagem nova for só agradecimento,
+despedida ou papo social depois de você já ter se despedido, responda com UMA
+frase curta sem pergunta (ou encerre em silêncio com silent=true). Só reabra a
+triagem se a pessoa trouxer um ASSUNTO NOVO (outro acidente, dúvida concreta).
+` : ""}
 FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
 ${memory || "(vazia — conversa nova)"}
 
@@ -878,6 +893,7 @@ async function decide({
     business = null,
     lookupResult = null,
     flows = [],
+    priorOutcome = null,
 }) {
     const model = process.env.MODEL || "claude-sonnet-5";
 
@@ -1009,7 +1025,7 @@ async function decide({
     const response = await anthropic.messages.create({
         model,
         max_tokens: 8192,
-        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows }),
+        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
