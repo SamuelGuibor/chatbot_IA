@@ -121,6 +121,8 @@ const STATES = [
     "pergunta_interesse",
     "contornando_objecao_1",
     "contornando_objecao_2",
+    "coleta_documentos",
+    "validacao_documentos",
     "encerrando",
 ];
 
@@ -904,33 +906,54 @@ async function decide({
         effMemory = await compactMemory(effMemory);
     }
 
-    // Áudio → transcrição via Gemini. Se falhar, devolve "não entendi"
-    // (o app Next cuida do failCount e do handoff após 2 falhas).
+    // Mídia do cliente:
+    //   - áudio      → transcrição via Gemini (Claude não aceita áudio);
+    //   - imagem/PDF → o Claude LÊ direto (bloco de visão anexado à mensagem).
+    //     O que fazer com o arquivo (confirmar, validar, pedir o próximo,
+    //     transferir com resumo) é decidido pelas INSTRUÇÕES + playbook — o
+    //     código não transfere mais automaticamente por causa de arquivo;
+    //   - outros tipos (vídeo, .docx...) → nota de sistema: a IA conduz sem
+    //     abrir o arquivo (pede foto/PDF se o conteúdo importar).
     let clientText = message;
+    let mediaBlock = null;
     if (media?.url) {
-        let transcript = null;
-        try {
-            transcript = await transcribeAudio(media);
-        } catch (err) {
-            console.error("[BOT] Falha ao transcrever áudio:", err.message);
-        }
-        if (transcript) {
-            clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
+        const mt = String(media.mimeType || "");
+        if (mt.startsWith("audio/")) {
+            let transcript = null;
+            try {
+                transcript = await transcribeAudio(media);
+            } catch (err) {
+                console.error("[BOT] Falha ao transcrever áudio:", err.message);
+            }
+            if (transcript) {
+                clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
+            } else {
+                return {
+                    reply: "Não consegui ouvir direito seu áudio 😅 Pode repetir ou mandar por escrito?",
+                    replies: [],
+                    action: "continue",
+                    handoffReason: undefined,
+                    lookup: null,
+                    memory: String(effMemory ?? ""),
+                    state: String(effState ?? "saudacao"),
+                    intent: "outro",
+                    emotion: "neutro",
+                    urgent: false,
+                    understood: false,
+                    confidence: 0.3,
+                };
+            }
+        } else if (mt.startsWith("image/")) {
+            mediaBlock = { type: "image", source: { type: "url", url: media.url } };
+            clientText = [clientText, "[o cliente enviou a IMAGEM anexa nesta mensagem — analise o conteúdo e conduza conforme as instruções]"]
+                .filter(Boolean).join("\n");
+        } else if (mt === "application/pdf") {
+            mediaBlock = { type: "document", source: { type: "url", url: media.url } };
+            clientText = [clientText, "[o cliente enviou o DOCUMENTO PDF anexo nesta mensagem — analise o conteúdo e conduza conforme as instruções]"]
+                .filter(Boolean).join("\n");
         } else {
-            return {
-                reply: "Não consegui ouvir direito seu áudio 😅 Pode repetir ou mandar por escrito?",
-                replies: [],
-                action: "continue",
-                handoffReason: undefined,
-                lookup: null,
-                memory: String(effMemory ?? ""),
-                state: String(effState ?? "saudacao"),
-                intent: "outro",
-                emotion: "neutro",
-                urgent: false,
-                understood: false,
-                confidence: 0.3,
-            };
+            clientText = [clientText, `[o cliente enviou um arquivo (${mt || "tipo desconhecido"}) que você NÃO consegue abrir — se o conteúdo for necessário, peça uma foto ou PDF; senão, siga o fluxo normalmente]`]
+                .filter(Boolean).join("\n");
         }
     }
 
@@ -947,7 +970,14 @@ async function decide({
     if (lookupResult) {
         parts.push(`RESULTADO DA CONSULTA QUE VOCÊ PEDIU (${lookupResult.kind}):\n${JSON.stringify(lookupResult.data)}\nUse este resultado para responder AGORA (não peça a mesma consulta de novo).`);
     }
-    messages.push({ role: "user", content: parts.join("\n\n") });
+    // Imagem/PDF entram como bloco de visão ANTES do texto, na mesma mensagem
+    // do cliente — o Claude enxerga o arquivo e o contexto juntos.
+    messages.push({
+        role: "user",
+        content: mediaBlock
+            ? [mediaBlock, { type: "text", text: parts.join("\n\n") }]
+            : parts.join("\n\n"),
+    });
 
     const response = await anthropic.messages.create({
         model,
