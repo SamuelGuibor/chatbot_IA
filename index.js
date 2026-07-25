@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
+const { decide, farewell, followupDecision, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
@@ -69,6 +69,26 @@ app.post("/farewell", async (req, res) => {
     console.error("[BOT] Erro na despedida:", err);
     // O app Next tem fallback de texto fixo — só sinalizamos o erro.
     res.status(500).json({ error: "farewell_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Decisão de follow-up do cron (app Next): quando o cliente sumiu 30min+ e a
+// última mensagem foi do bot, a IA decide se ainda cabe cutucar ou se a conversa
+// já teve fecho natural (encerrar em silêncio).
+// Body: { contact, history, memory, state } → { action: "nudge"|"close", message, reason }
+app.post("/followup-decision", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory, state } = req.body || {};
+  try {
+    const decision = await followupDecision({ contact, history, memory, state });
+    console.log(`[BOT] follow-up ${contact?.name ?? "?"}: ${decision.action}${decision.reason ? ` (${decision.reason})` : ""}`);
+    res.json(decision);
+  } catch (err) {
+    console.error("[BOT] Erro na decisão de follow-up:", err);
+    // O app Next tem fallback (heurística local) — só sinalizamos o erro.
+    res.status(500).json({ error: "followup_error", detail: String(err?.message ?? err) });
   }
 });
 

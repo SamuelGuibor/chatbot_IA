@@ -186,10 +186,16 @@ const responseSchema = {
             type: "boolean",
             description: "true SOMENTE se o cliente pediu CLARAMENTE, pelo contexto, para PARAR de receber mensagens/ser descadastrado (ex.: 'não quero mais receber', 'me tira dessa lista', 'para de me mandar mensagem'). NÃO marque true quando 'sair'/'parar' aparecem em outro sentido (ex.: 'vou precisar sair, mas já volto', 'quero sair da fila do INSS', 'pode parar de me ligar' — ligação não é WhatsApp). Na dúvida, deixe false.",
         },
+        appliedRules: {
+            type: "array",
+            items: { type: "string" },
+            description: "IDs das LIÇÕES APRENDIDAS (ex.: 'R3') que INFLUENCIARAM esta resposta — mudaram o que você diria ou como diria. [] quando nenhuma pesou. Cite só as que de fato usou; não liste por precaução.",
+        },
     },
     required: [
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
         "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence", "optOut",
+        "appliedRules",
     ],
 };
 
@@ -713,13 +719,23 @@ const BRAIN_TIMEOUT_MS = 8000;
 
 let brainCache = { text: null, fetchedAt: 0, version: null, playbookVersion: null };
 
-/** Formata as regras aprendidas como um bloco de texto para o prompt. */
+/**
+ * Formata as regras aprendidas como um bloco de texto para o prompt.
+ *
+ * Cada regra ganha um ID sequencial e DETERMINÍSTICO ([R1], [R2]...) na ordem
+ * seção→regra. O app Next reconstrói o MESMO mapeamento (mesma convenção) para
+ * traduzir os IDs citados em `appliedRules` de volta pra regra/lição/review de
+ * origem — é o que alimenta a dash de métricas das regras. Numeração muda
+ * apenas quando uma versão nova do playbook é publicada (o bloco inteiro troca
+ * junto, então o cache de prompt já seria invalidado de qualquer forma).
+ */
 function renderPlaybook(playbook) {
     if (!playbook?.sections?.length) return "";
+    let seq = 0;
     const body = playbook.sections
         .filter((s) => s.rules?.length)
         .map((s) => {
-            const rules = s.rules.map((r) => `- ${r.text}`).join("\n");
+            const rules = s.rules.map((r) => `- [R${++seq}] ${r.text}`).join("\n");
             return `${s.name}:\n${rules}`;
         })
         .join("\n\n");
@@ -730,6 +746,9 @@ function renderPlaybook(playbook) {
         "═══════════════════════════════════════",
         "",
         "Regras extraídas de atendimentos reais já revisados por um supervisor.",
+        "Quando alguma dessas regras INFLUENCIAR a sua resposta (mudou o que você",
+        "diria ou como diria), cite o ID dela (ex.: R3) no campo appliedRules da",
+        "sua saída. Não cite regra que não pesou na resposta.",
         "",
         body,
     ].join("\n");
@@ -983,6 +1002,12 @@ async function decide({
         understood: parsed.understood !== false,
         confidence: Math.min(Math.max(Number(parsed.confidence ?? 0.8), 0), 1),
         optOut: Boolean(parsed.optOut),
+        // IDs das regras do playbook que pesaram nesta resposta (R1, R2...).
+        // O app Next traduz de volta pra regra/lição de origem e grava o evento
+        // que alimenta a dash de métricas das regras aprendidas.
+        appliedRules: Array.isArray(parsed.appliedRules)
+            ? [...new Set(parsed.appliedRules.map((r) => String(r).trim().toUpperCase()).filter((r) => /^R\d+$/.test(r)))]
+            : [],
     };
 }
 
@@ -1124,6 +1149,102 @@ async function farewell({ contact, history, memory }) {
 }
 
 // ---------------------------------------------------------------------------
+// DECISÃO DE FOLLOW-UP — o cron do app Next chama isto quando o cliente ficou
+// 30min+ sem responder E a última mensagem foi do bot. Em vez de mandar sempre
+// o fixo "Você precisa de mais alguma coisa?", a IA lê a conversa e decide:
+//   - "nudge": há uma pergunta/pendência REAL em aberto → cutuca (texto curto
+//     e contextual; se vier vazio, o cron usa o texto padrão).
+//   - "close": a conversa já teve um FECHO NATURAL (o bot já se despediu, o
+//     cliente combinou retorno pra amanhã, o assunto foi resolvido) → NÃO
+//     cutuca; o cron encerra em silêncio, sem re-pingar quem já foi despedido.
+// Na dúvida a IA prefere "close": incomodar é pior que encerrar cedo.
+// ---------------------------------------------------------------------------
+const followupSchema = {
+    type: "object",
+    properties: {
+        action: {
+            type: "string",
+            enum: ["nudge", "close"],
+            description: "nudge = ainda cabe cutucar; close = já houve fecho natural, encerrar em silêncio.",
+        },
+        message: {
+            type: "string",
+            description:
+                "action=nudge: a mensagem curta a enviar (1 frase, calorosa, referente ao que ficou pendente; nunca cite CPF/documentos); vazio usa o texto padrão. action=close: NORMALMENTE vazio (encerra em silêncio); preencha com UMA frase suave de fecho SOMENTE se o bot ainda não se despediu nesta conversa.",
+        },
+        reason: {
+            type: "string",
+            description: "Motivo curto da decisão, para log.",
+        },
+    },
+    required: ["action", "message", "reason"],
+    additionalProperties: false,
+};
+
+async function followupDecision({ contact, history, memory, state }) {
+    const model = process.env.MODEL || "claude-opus-4-8";
+
+    const transcript = (Array.isArray(history) ? history : [])
+        .slice(-20)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 250,
+        system: [
+            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "Um cliente ficou mais de 30 minutos sem responder e a ÚLTIMA mensagem foi do bot.",
+            "Olhando a conversa, decida se ainda faz sentido cutucar o cliente ou se ela já teve um FECHO NATURAL.",
+            "",
+            'Escolha "close" (encerrar em silêncio, SEM mandar nenhuma mensagem) quando:',
+            "- O bot já se despediu (ex.: 'boa noite', 'até amanhã', 'fica com Deus', 'falamos amanhã', 'descanse').",
+            "- O cliente combinou retorno (ex.: 'te envio amanhã', 'amanhã cedo', 'depois te falo').",
+            "- O assunto foi resolvido/combinado e não há pergunta em aberto.",
+            "Nesses casos, mandar 'Você precisa de mais alguma coisa?' é INTRUSIVO e reabre a conversa à toa.",
+            "Em close: se o bot JÁ se despediu, deixe message vazio (silêncio total — não repita despedida).",
+            "Se o assunto morreu mas NINGUÉM se despediu ainda, você PODE preencher message com uma frase única",
+            "e suave de fecho (ex.: 'Qualquer coisa é só chamar por aqui!') — nunca uma pergunta.",
+            "",
+            'Escolha "nudge" (cutucar) SOMENTE quando há uma pergunta ou pendência REAL em aberto que o cliente',
+            "deixou sem responder — ex.: o bot pediu um dado/documento e o cliente sumiu no meio, sem combinar retorno.",
+            "Ao cutucar, escreva UMA frase curta e calorosa sobre o que ficou pendente (nunca cite CPF/documentos).",
+            "",
+            'Na dúvida entre os dois, prefira "close": é melhor não incomodar.',
+        ].join("\n"),
+        output_config: {
+            format: { type: "json_schema", schema: followupSchema },
+        },
+        messages: [{
+            role: "user",
+            content:
+                `Nome do cliente: ${contact?.name ?? "não informado"}\n` +
+                (state ? `Etapa atual da conversa: ${state}\n` : "") +
+                (memory ? `Ficha da conversa: ${clipText(memory, 1200)}\n` : "") +
+                (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try {
+        out = JSON.parse(raw);
+    } catch {
+        throw new Error("decisão de follow-up não é JSON válido");
+    }
+    const action = out.action === "nudge" ? "nudge" : "close";
+    return {
+        action,
+        // Em close a message também pode vir preenchida: é a frase única e suave
+        // de fecho quando ninguém se despediu ainda (vazia = silêncio total).
+        message: String(out.message ?? "").trim(),
+        reason: String(out.reason ?? "").trim(),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // CÉREBRO — PASSO A: extrair a LIÇÃO de uma revisão humana.
 //
 // Roda uma vez por revisão, logo que o humano salva o julgamento. Lê a conversa
@@ -1257,8 +1378,13 @@ const playbookSchema = {
                                 text: { type: "string", description: "A regra, no imperativo, 1-2 linhas." },
                                 weight: { type: "integer", description: "Quantas revisões sustentam esta regra." },
                                 states: { type: "array", items: { type: "string" } },
+                                sourceIndexes: {
+                                    type: "array",
+                                    items: { type: "integer" },
+                                    description: "Números (1-based, da lista LIÇÕES NOVAS) das lições que sustentam/originaram esta regra. [] se a regra vem apenas do manual atual, sem lição nova.",
+                                },
                             },
-                            required: ["text", "weight", "states"],
+                            required: ["text", "weight", "states", "sourceIndexes"],
                             additionalProperties: false,
                         },
                     },
@@ -1304,6 +1430,10 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
             "ESTILO DE CADA REGRA: imperativo, 1 a 2 linhas, concreta e verificável.",
             "Sem nome de cliente, sem caso concreto, sem dado sensível.",
             "Descarte regras genéricas do tipo 'seja educado' — não acrescentam nada.",
+            "",
+            "RASTREABILIDADE: em cada regra, preencha sourceIndexes com os números das",
+            "LIÇÕES NOVAS que a sustentam (a que a originou e as que foram fundidas nela).",
+            "Regra mantida do manual atual sem lição nova envolvida → sourceIndexes [].",
         ].join("\n"),
         output_config: {
             format: { type: "json_schema", schema: playbookSchema },
@@ -1344,7 +1474,7 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
 }
 
 module.exports = {
-    decide, farewell, suggest, summarize, transcribeAudio,
+    decide, farewell, followupDecision, suggest, summarize, transcribeAudio,
     distillLesson, consolidatePlaybook,
     // Exportado para diagnóstico: permite conferir de fora qual prompt o bot
     // está usando (remoto do CRM ou o embutido de fallback) sem gastar uma
