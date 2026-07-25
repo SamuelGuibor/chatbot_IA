@@ -193,11 +193,15 @@ const responseSchema = {
             items: { type: "string" },
             description: "IDs das LIÇÕES APRENDIDAS (ex.: 'R3') que INFLUENCIARAM esta resposta — mudaram o que você diria ou como diria. [] quando nenhuma pesou. Cite só as que de fato usou; não liste por precaução.",
         },
+        silent: {
+            type: "boolean",
+            description: "true SOMENTE quando encerrar SEM enviar nenhuma mensagem é deliberadamente o correto — ex.: o cliente só agradeceu/se despediu DEPOIS que você já se despediu, e responder de novo seria repetir despedida. NUNCA use true num atendimento em andamento nem na primeira despedida. Quando silent=true, deixe reply vazio e use action=resolve ou disqualify.",
+        },
     },
     required: [
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
         "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence", "optOut",
-        "appliedRules",
+        "appliedRules", "silent",
     ],
 };
 
@@ -820,7 +824,7 @@ async function transcribeAudio(media) {
     if (!media?.url || !media?.mimeType) return null;
     if (!genAI) throw new Error("transcrição indisponível: GOOGLE_API_KEY ausente");
 
-    const res = await fetch(media.url);
+    const res = await fetch(media.url, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) throw new Error(`download da mídia falhou: HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length > MAX_AUDIO_BYTES) throw new Error("mídia grande demais para a IA");
@@ -831,7 +835,9 @@ async function transcribeAudio(media) {
             role: "user",
             parts: [
                 { text: "Transcreva este áudio em português do Brasil. Responda SOMENTE com a transcrição, sem comentários." },
-                { inlineData: { mimeType: media.mimeType, data: buf.toString("base64") } },
+                // WhatsApp manda "audio/ogg; codecs=opus" — o parâmetro após
+                // ";" derruba a validação de mimeType do Gemini.
+                { inlineData: { mimeType: media.mimeType.split(";")[0].trim(), data: buf.toString("base64") } },
             ],
         }],
     });
@@ -943,14 +949,35 @@ async function decide({
                     confidence: 0.3,
                 };
             }
-        } else if (mt.startsWith("image/")) {
-            mediaBlock = { type: "image", source: { type: "url", url: media.url } };
-            clientText = [clientText, "[o cliente enviou a IMAGEM anexa nesta mensagem — analise o conteúdo e conduza conforme as instruções]"]
-                .filter(Boolean).join("\n");
-        } else if (mt === "application/pdf") {
-            mediaBlock = { type: "document", source: { type: "url", url: media.url } };
-            clientText = [clientText, "[o cliente enviou o DOCUMENTO PDF anexo nesta mensagem — analise o conteúdo e conduza conforme as instruções]"]
-                .filter(Boolean).join("\n");
+        } else if (mt.startsWith("image/") || mt.split(";")[0].trim() === "application/pdf") {
+            // Baixa AGORA e manda como base64 (igual ao áudio): a URL do S3 é
+            // pré-assinada com 600s — se a mensagem cair numa fila de retry, a
+            // Anthropic receberia uma URL morta e a falha viraria loop. Também
+            // aplica teto de tamanho (limite da API: ~5MB imagem, 32MB PDF) e
+            // normaliza o mimeType (WhatsApp manda "audio/ogg; codecs=opus" e
+            // afins — parâmetro após ";" derruba a validação da API).
+            const baseMime = mt.split(";")[0].trim();
+            const isPdf = baseMime === "application/pdf";
+            const MAX_BYTES = isPdf ? 30 * 1024 * 1024 : 4.5 * 1024 * 1024;
+            try {
+                const resp = await fetch(media.url, { signal: AbortSignal.timeout(15000) });
+                if (!resp.ok) throw new Error(`download da mídia: HTTP ${resp.status}`);
+                const buf = Buffer.from(await resp.arrayBuffer());
+                if (buf.length > MAX_BYTES) {
+                    clientText = [clientText, `[o cliente enviou ${isPdf ? "um PDF" : "uma imagem"} grande demais para você abrir (${Math.round(buf.length / 1024 / 1024)}MB) — peça para reenviar menor (foto mais leve ou PDF só das páginas necessárias) e siga conforme as instruções]`]
+                        .filter(Boolean).join("\n");
+                } else {
+                    mediaBlock = isPdf
+                        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
+                        : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } };
+                    clientText = [clientText, `[o cliente enviou ${isPdf ? "o DOCUMENTO PDF" : "a IMAGEM"} anexo nesta mensagem — analise o conteúdo e conduza conforme as instruções]`]
+                        .filter(Boolean).join("\n");
+                }
+            } catch (err) {
+                console.error("[BOT] Falha ao baixar imagem/PDF:", err.message);
+                clientText = [clientText, "[o cliente enviou um arquivo que não pôde ser aberto por falha técnica — confirme o recebimento, peça para reenviar se o conteúdo for necessário, e siga conforme as instruções]"]
+                    .filter(Boolean).join("\n");
+            }
         } else {
             clientText = [clientText, `[o cliente enviou um arquivo (${mt || "tipo desconhecido"}) que você NÃO consegue abrir — se o conteúdo for necessário, peça uma foto ou PDF; senão, siga o fluxo normalmente]`]
                 .filter(Boolean).join("\n");
@@ -1038,6 +1065,10 @@ async function decide({
         appliedRules: Array.isArray(parsed.appliedRules)
             ? [...new Set(parsed.appliedRules.map((r) => String(r).trim().toUpperCase()).filter((r) => /^R\d+$/.test(r)))]
             : [],
+        // Silêncio DELIBERADO: encerrar sem mensagem é escolha explícita da IA
+        // (ex.: agradecimento pós-despedida). Sem esta flag, desfecho terminal
+        // com reply vazio é tratado como erro pelo app Next (fallback + log).
+        silent: Boolean(parsed.silent),
     };
 }
 
