@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, followupDecision, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
+const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
@@ -81,6 +81,26 @@ app.post("/farewell", async (req, res) => {
     console.error("[BOT] Erro na despedida:", err);
     // O app Next tem fallback de texto fixo — só sinalizamos o erro.
     res.status(500).json({ error: "farewell_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// Provocação de RECUPERAÇÃO (cron do app Next): conversa em standby chegou na
+// hora da tentativa. Devolve o texto contextual (janela aberta) e a pendência
+// curta usada como variável do template (janela fechada).
+// Body: { contact, history, memory, state, attempt, maxAttempts } → { message, pending }
+app.post("/recovery-message", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory, state, attempt, maxAttempts } = req.body || {};
+  try {
+    const out = await recoveryMessage({ contact, history, memory, state, attempt, maxAttempts });
+    console.log(`[BOT] recovery ${contact?.name ?? "?"} (tentativa ${attempt ?? 1}): ${out.message.slice(0, 80)}...`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BOT] Erro na provocação de recuperação:", err);
+    // O app Next tem fallback de textos fixos — só sinalizamos o erro.
+    res.status(500).json({ error: "recovery_error", detail: String(err?.message ?? err) });
   }
 });
 

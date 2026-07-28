@@ -1417,6 +1417,93 @@ async function followupDecision({ contact, history, memory, state }) {
 }
 
 // ---------------------------------------------------------------------------
+// PROVOCAÇÃO DE RECUPERAÇÃO — o cron do app Next chama isto quando uma conversa
+// em "standby" (cliente sumiu no meio da triagem) chega na hora da provocação
+// (até 3, em ~3 dias). Devolve DUAS coisas:
+//   - message: o texto da provocação, usado quando a janela de 24h da Meta está
+//     ABERTA (texto livre). Deve ser contextual: citar o que ficou pendente e
+//     lembrar o cliente do que ele GANHA voltando (falta pouco pro auxílio).
+//   - pending: a pendência em POUCAS palavras ("enviar seus documentos") —
+//     entra como variável {{2}} do template aprovado quando a janela está
+//     FECHADA (fora da janela a Meta só aceita template; o texto é fixo e só
+//     as variáveis personalizam).
+// O app tem fallback de textos fixos se isto falhar.
+// ---------------------------------------------------------------------------
+const recoverySchema = {
+    type: "object",
+    properties: {
+        message: {
+            type: "string",
+            description: "A mensagem de provocação completa (2 a 4 frases), pronta pra enviar no WhatsApp.",
+        },
+        pending: {
+            type: "string",
+            description: "A pendência da conversa em 3 a 6 palavras, minúsculas, completando a frase 'falta só {pendência}' — ex.: 'enviar seus documentos', 'me contar como foi o acidente'.",
+        },
+    },
+    required: ["message", "pending"],
+    additionalProperties: false,
+};
+
+async function recoveryMessage({ contact, history, memory, state, attempt = 1, maxAttempts = 3 }) {
+    const model = process.env.MODEL || "claude-opus-4-8";
+
+    const transcript = (Array.isArray(history) ? history : [])
+        .slice(-20)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const isFinal = attempt >= maxAttempts;
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 350,
+        system: [
+            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "Um cliente COMEÇOU a triagem do Auxílio-Acidente mas parou de responder, e estamos tentando resgatá-lo.",
+            `Esta é a tentativa ${attempt} de ${maxAttempts}.`,
+            "",
+            "Escreva UMA mensagem de provocação (2 a 4 frases, português do Brasil, tom caloroso de WhatsApp, pode usar 1 emoji):",
+            "- Seja CONTEXTUAL: retome a conversa de onde parou, citando a pendência concreta (ex.: enviar documentos, contar como foi o acidente, confirmar um dado). Nunca cite CPF, endereço ou dados sensíveis.",
+            "- Desperte interesse: lembre que falta POUCO pra concluir e que ele pode ter direito ao benefício — sem prometer valores nem garantir aprovação.",
+            "- Termine com um convite fácil de responder ('é só me responder por aqui', 'posso continuar?').",
+            attempt === 1
+                ? "- Tom leve, como quem retoma uma conversa de ontem."
+                : isFinal
+                    ? "- É a ÚLTIMA tentativa: diga isso com elegância (ex.: 'essa é minha última mensagem, tá?') e crie senso de 'seria uma pena parar agora que falta tão pouco'. Sem pressão agressiva nem prazo falso."
+                    : "- Tom um pouco mais direto que a primeira: reforce o benefício de concluir.",
+            "",
+            "Além da mensagem, devolva a PENDÊNCIA da conversa em 3 a 6 palavras (campo pending),",
+            "completando a frase 'falta só {pendência}' — ela vira variável de um template do WhatsApp.",
+        ].join("\n"),
+        output_config: {
+            format: { type: "json_schema", schema: recoverySchema },
+        },
+        messages: [{
+            role: "user",
+            content:
+                `Nome do cliente: ${contact?.name ?? "não informado"}\n` +
+                (state ? `Etapa atual da conversa: ${state}\n` : "") +
+                (memory ? `Ficha da conversa: ${clipText(memory, 1200)}\n` : "") +
+                (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try {
+        out = JSON.parse(raw);
+    } catch {
+        throw new Error("mensagem de recuperação não é JSON válido");
+    }
+    return {
+        message: String(out.message ?? "").trim(),
+        pending: String(out.pending ?? "").trim(),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // CÉREBRO — PASSO A: extrair a LIÇÃO de uma revisão humana.
 //
 // Roda uma vez por revisão, logo que o humano salva o julgamento. Lê a conversa
@@ -1646,7 +1733,7 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
 }
 
 module.exports = {
-    decide, farewell, followupDecision, suggest, summarize, transcribeAudio,
+    decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio,
     distillLesson, consolidatePlaybook,
     // Exportado para diagnóstico: permite conferir de fora qual prompt o bot
     // está usando (remoto do CRM ou o embutido de fallback) sem gastar uma
