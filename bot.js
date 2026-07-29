@@ -265,7 +265,14 @@ cliente (se conhecido), os dados do sistema, a ficha de fatos, a etapa atual,
 os fluxos disponíveis e o horário. Nos exemplos abaixo, substitua "[nome]"
 pelo nome do cliente (só o primeiro nome) e "[saudação do horário]" pela
 saudação indicada nos dados (bom dia / boa tarde / boa noite). Se você ainda
-não sabe o nome, cumprimente sem ele.
+não sabe o nome, cumprimente sem ele. NUNCA escreva o texto literal "[nome]"
+(nem qualquer outro placeholder entre colchetes) numa mensagem ao cliente:
+sem nome conhecido, reescreva a frase omitindo o nome ("Entendi. Infelizmente...",
+não "Entendi, [nome]. Infelizmente..."). Atenção: o NOME DO CLIENTE dos dados
+pode ser o apelido ou nome comercial do perfil do WhatsApp (ex.: "maria123",
+"jsilva_88", "Dimensão Elétrica e Hidráulica") — se parecer nome de usuário ou
+nome de EMPRESA e não um nome real de pessoa, não chame o cliente por ele;
+pergunte o nome na etapa coleta_nome e trate como desconhecido até lá.
 
 EMOJI — USE COM MODERAÇÃO: no máximo 1 emoji a cada 2-3 mensagens, nunca mais
 de um emoji na MESMA mensagem. A maioria das suas respostas deve sair SEM
@@ -974,6 +981,22 @@ function usageFrom(response, model) {
 }
 
 // ---------------------------------------------------------------------------
+// Rede de segurança da SAÍDA: o modelo às vezes copia o placeholder "[nome]"
+// literalmente dos exemplos quando não sabe o nome ("Entendi, [nome], ...")
+// e já saiu mensagem com pontuação solta no início (";tendi...") em produção.
+// Remove esses artefatos sem tocar em texto bom.
+// ---------------------------------------------------------------------------
+function sanitizeReply(text) {
+    if (!text) return "";
+    return String(text)
+        .replace(/,?\s*\[nome\]/gi, "")
+        .replace(/,?\s*\[saudação do horário\]/gi, "")
+        .replace(/^[;,.:]+\s*/, "")
+        .replace(/ {2,}/g, " ")
+        .trim();
+}
+
+// ---------------------------------------------------------------------------
 // Decide resposta da IA
 // ---------------------------------------------------------------------------
 async function decide({
@@ -1151,9 +1174,9 @@ async function decide({
 
     return {
         usage,
-        reply: String(parsed.reply ?? "").trim(),
+        reply: sanitizeReply(parsed.reply),
         replies: Array.isArray(parsed.replies)
-            ? parsed.replies.map((r) => String(r).trim()).filter(Boolean)
+            ? parsed.replies.map((r) => sanitizeReply(r)).filter(Boolean)
             : [],
         action: ["continue", "qualify", "disqualify", "handoff", "lookup", "send_flow", "resolve"].includes(parsed.action)
             ? parsed.action
