@@ -80,7 +80,7 @@ function pruneHistory(history, budget = HISTORY_TOKEN_BUDGET) {
  * então a compactação acontece no máximo uma vez por "estouro".
  */
 async function compactMemory(memory) {
-    const model = process.env.MODEL_SMALL || "claude-haiku-4-5";
+    const model = process.env.MODEL_SMALL;
     try {
         const response = await anthropic.messages.create({
             model,
@@ -376,6 +376,20 @@ SE priorOutcome.qualified === true  → NUNCA rodar triagem. Classificar a mensa
   • dúvida pontual → responder → action: "continue" (ou "resolve" se encerrou)
   • acidente DIFERENTE/novo → aí sim iniciar triagem só do caso novo → action: "continue"
   • ambíguo → "Você quer tirar uma dúvida ou dar entrada em um novo caso?" → action: "continue"
+
+SE priorOutcome.qualified === false (cliente já DESQUALIFICADO em atendimento anterior):
+  → A FICHA guarda o caso analisado e o MOTIVO da desqualificação (fora do prazo,
+    sem cobertura do INSS, sem fratura/sequela...). Consulte-a SEMPRE antes de responder.
+  • Cliente volta falando do MESMO caso já desqualificado → NÃO refaça a triagem e
+    NÃO crie falsa expectativa: reafirme com empatia o motivo que está na ficha
+    (1-2 frases) e se despeça → action: "disqualify", closeCategory: "nao_qualificado".
+  • Cliente traz um acidente DIFERENTE do desqualificado (outra data/lesão) → rode a
+    triagem SOMENTE do caso novo. Aproveite o que a ficha já tem (nome, profissão,
+    situação no INSS...) e NÃO repita perguntas já respondidas. O caso novo é julgado
+    pelos critérios normais, sem ser contaminado pela desqualificação do antigo.
+  • Dúvida pontual → responder → action: "continue" (ou "resolve" se encerrou).
+  • Ambíguo (não dá pra saber se é o mesmo caso ou um novo) → pergunte UMA coisa:
+    "Esse é o mesmo acidente que conversamos antes, ou aconteceu outro?" → action: "continue".
 
 SE o bloco ATENDIMENTO ANTERIOR existir (qualquer categoria, qualificado ou não):
   é uma RETOMADA — NUNCA volte à saudação nem repita a triagem já feita (a ficha
@@ -796,6 +810,10 @@ triagem: use a FICHA e o histórico. Se a mensagem nova for só agradecimento,
 despedida ou papo social depois de você já ter se despedido, responda com UMA
 frase curta sem pergunta (ou encerre em silêncio com silent=true). Só reabra a
 triagem se a pessoa trouxer um ASSUNTO NOVO (outro acidente, dúvida concreta).
+${priorOutcome.qualified === false ? `ATENÇÃO — o caso anterior foi DESQUALIFICADO e o motivo está na FICHA: não
+reabra a triagem para o MESMO caso (reafirme o motivo com empatia e encerre).
+Triagem de novo SOMENTE se for um acidente DIFERENTE do que está na ficha — e,
+nesse caso, sem repetir perguntas que a ficha já responde.` : ""}
 ` : ""}
 FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
 ${memory || "(vazia — conversa nova)"}
@@ -996,6 +1014,38 @@ function sanitizeReply(text) {
         .trim();
 }
 
+// 29/07/2026 (caso Mateus Leandro): a saída estruturada degenerou e o modelo
+// vazou o esqueleto do próprio JSON como itens de `replies` ('replies":[],',
+// 'action":', 'flowNam', 'nenhum'...) — cada fragmento virou uma mensagem no
+// WhatsApp do cliente. Blocos legítimos de `replies` são sempre frases
+// completas; item que parece fragmento de JSON ou token solto do schema é
+// descartado aqui, na fonte.
+const SCHEMA_TOKENS = new Set([
+    "reply", "replies", "action", "flowname", "closecategory", "handoffreason",
+    "lookup", "memory", "state", "intent", "emotion", "urgent", "understood",
+    "confidence", "optout", "appliedrules", "silent", "usage",
+    "continue", "qualify", "disqualify", "handoff", "send_flow", "sendflow",
+    "resolve", "nenhum", "null", "true", "false",
+]);
+
+// Pontuação estrutural de JSON ('"key":', '[]', começa com {,}:...).
+function isJsonSkeleton(text) {
+    return /"\s*:/.test(text) || /\[\s*\]/.test(text) || /^\s*[{}\[\],:]/.test(text);
+}
+
+// Item de `replies` que é lixo de JSON, e não um bloco de mensagem real.
+function looksLikeJsonFragment(text) {
+    const t = String(text).trim();
+    if (!t) return true;
+    if (isJsonSkeleton(t)) return true;
+    // Chave/valor do schema como palavra solta ("handoffReason", "continue").
+    const bare = t.toLowerCase().replace(/[^a-z_]/g, "");
+    if (SCHEMA_TOKENS.has(bare)) return true;
+    // Token solto: sem espaço, curto e sem cara de frase ("flowNam", "nenh").
+    if (!/\s/.test(t) && t.length <= 15 && !/[.!?…]$/.test(t)) return true;
+    return false;
+}
+
 // ---------------------------------------------------------------------------
 // Decide resposta da IA
 // ---------------------------------------------------------------------------
@@ -1172,12 +1222,25 @@ async function decide({
         console.log(`[BOT] tokens: in=${usage.inputTokens} out=${usage.outputTokens} cacheRead=${usage.cacheReadTokens} cacheWrite=${usage.cacheWriteTokens}`);
     }
 
+    // Filtro anti-vazamento de JSON (ver looksLikeJsonFragment). No `reply`
+    // único só o teste estrutural: mensagem curta legítima ("Ok!") não pode
+    // ser descartada por parecer token solto.
+    const cleanReply = (() => {
+        const r = sanitizeReply(parsed.reply);
+        return r && isJsonSkeleton(r) ? "" : r;
+    })();
+    const rawReplies = Array.isArray(parsed.replies)
+        ? parsed.replies.map((r) => sanitizeReply(r)).filter(Boolean)
+        : [];
+    const cleanReplies = rawReplies.filter((r) => !looksLikeJsonFragment(r));
+    if (cleanReplies.length !== rawReplies.length || cleanReply !== sanitizeReply(parsed.reply)) {
+        console.warn(`[BOT] saída da IA continha fragmento(s) de JSON — descartados ${rawReplies.length - cleanReplies.length} item(ns) de replies.`);
+    }
+
     return {
         usage,
-        reply: sanitizeReply(parsed.reply),
-        replies: Array.isArray(parsed.replies)
-            ? parsed.replies.map((r) => sanitizeReply(r)).filter(Boolean)
-            : [],
+        reply: cleanReply,
+        replies: cleanReplies,
         action: ["continue", "qualify", "disqualify", "handoff", "lookup", "send_flow", "resolve"].includes(parsed.action)
             ? parsed.action
             : "continue",
@@ -1271,7 +1334,7 @@ async function suggest({ contact, processInfo, history = [], memory = null, agen
 // RESUMO CURTO da conversa (vira comentário no card do kanban ao vincular).
 // ---------------------------------------------------------------------------
 async function summarize({ contact, history = [], memory = null }) {
-    const model = process.env.MODEL_SMALL || "claude-haiku-4-5";
+    const model = process.env.MODEL_SMALL;
 
     const transcript = pruneHistory(history, 2600)
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
@@ -1377,7 +1440,7 @@ const followupSchema = {
 };
 
 async function followupDecision({ contact, history, memory, state }) {
-    const model = process.env.MODEL || "claude-opus-4-8";
+    const model = process.env.MODEL;
 
     const transcript = (Array.isArray(history) ? history : [])
         .slice(-20)
