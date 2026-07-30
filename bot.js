@@ -763,6 +763,21 @@ REGRAS IMPORTANTES:
 ═══════════════════════════════════════
 
 - Na TRIAGEM (antes de qualificar): sempre UMA pergunta por vez, esperando a resposta do cliente entre elas.
+- EXTRAIA ANTES DE AVANÇAR: você só pode avançar de etapa depois de REGISTRAR
+  NA FICHA o dado que a etapa atual pedia. Se a resposta do cliente NÃO trouxe
+  esse dado (respondeu outra coisa, mudou de assunto, mandou só emoji), trate o
+  que ele disse e REPITA a pergunta da etapa atual reformulada — NUNCA pule
+  para a próxima pergunta com o dado anterior em branco. Antes de cada
+  resposta, confira: "o que a etapa atual pede já está na ficha?"
+- MENSAGEM CRUZADA: quando a mensagem do cliente vier acompanhada de uma NOTA
+  DO SISTEMA dizendo que ela CRUZOU com a sua última mensagem, ela é resposta
+  à sua pergunta ANTERIOR — registre o dado na pergunta certa e não trate como
+  resposta à pergunta mais recente. Se ficou pergunta sem resposta, retome-a
+  com naturalidade.
+- NOME DO CLIENTE: pergunte o nome no MÁXIMO 2 vezes na conversa toda, sempre
+  como pergunta ÚNICA (nunca emendada com outra pergunta). Se o cliente não
+  responder o nome nas 2 vezes, siga o atendimento SEM o nome (sem vocativo) e
+  não pergunte de novo.
 - Ao QUALIFICAR: dispare o roteiro comercial INTEIRO de uma vez pelo campo "replies" (Blocos 1 a 6), como mensagens separadas, SEM esperar resposta entre elas.
 - O objetivo é criar conexão e desejo antes do qualify.
 - Nunca prometa que ele vai ganhar.
@@ -1081,13 +1096,27 @@ async function decide({
     //  - state vazio/null: o encerramento (atendente ou desqualificação) JÁ
     //    zerou memória e estado, mas o histórico de mensagens antigas ainda
     //    chega aqui — e faria a IA repetir o assunto velho ("já te encaminhei").
-    // Nos dois casos começamos do ZERO, mantendo só o NOME (vem do contato).
+    //
+    // EXCEÇÃO (30/07/2026, caso naircardoso260): quando há priorOutcome
+    // conhecido (qualificado OU desqualificado), a FICHA e o HISTÓRICO são
+    // justamente o que o prompt manda consultar ("o motivo está na FICHA",
+    // "não repita a triagem já feita"). Zerar aqui contradizia o prompt: a
+    // cliente desqualificada respondia ao encerramento, a IA voltava amnésica,
+    // reabria a triagem e desqualificava DE NOVO — 3 desqualificações na mesma
+    // tarde. Com desfecho anterior, só o state recomeça; ficha e histórico
+    // ficam. Sem desfecho (conversa realmente nova), zera tudo como antes.
     const novoAtendimento = !state || state === "encerrando";
     if (novoAtendimento) {
-        console.log(`[BOT] ${contact?.phone ?? "?"} → NOVO atendimento (memória e histórico anteriores zerados).`);
-        effMemory = null;
+        const temDesfecho = priorOutcome
+            && (priorOutcome.qualified != null || priorOutcome.closeCategory);
         effState = "saudacao";
-        effHistory = [];
+        if (temDesfecho) {
+            console.log(`[BOT] ${contact?.phone ?? "?"} → retomada pós-desfecho (ficha e histórico PRESERVADOS; state reiniciado).`);
+        } else {
+            console.log(`[BOT] ${contact?.phone ?? "?"} → NOVO atendimento (memória e histórico anteriores zerados).`);
+            effMemory = null;
+            effHistory = [];
+        }
     }
 
     // Ficha estourou o limite? Compacta ANTES de montar o prompt (o resultado
@@ -1590,6 +1619,258 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
 }
 
 // ---------------------------------------------------------------------------
+// EXTRAÇÃO DOS DADOS DA PROCURAÇÃO (integração ZapSign do app Next).
+//
+// Chamada quando a coleta de documentos termina: recebe a ficha, o histórico e
+// as MÍDIAS enviadas pelo cliente (RG/CNH em foto ou PDF, via URLs
+// pré-assinadas do S3) e devolve os campos do KIT_PREV_CSS (procuração +
+// contrato + declaração de hipossuficiência), um a um, com confiança e fonte.
+//
+// REGRA DE OURO: NUNCA inventar. Campo que não está nem nos documentos nem na
+// conversa volta vazio com source="ausente" — é o app Next que decide se
+// manda pra revisão humana. Documento (RG/CNH) é fonte PRIMÁRIA para nome,
+// RG, CPF; a conversa cobre endereço, estado civil e profissão.
+// ---------------------------------------------------------------------------
+const CONTRACT_FIELD_KEYS = [
+    "name", "nacionalidade", "estado_civil", "profissao", "rg", "cpf",
+    "rua", "numero", "bairro", "cep", "cidade", "estado",
+];
+
+const contractFieldSchema = {
+    type: "object",
+    properties: {
+        value: { type: "string", description: "O valor extraído, formatado. Vazio se não encontrado." },
+        confidence: { type: "number", description: "0 a 1 — confiança na leitura/atribuição." },
+        source: {
+            type: "string",
+            enum: ["documento", "conversa", "inferido", "ausente"],
+            description: "De onde o valor veio: documento (RG/CNH anexo), conversa (texto do cliente), inferido (dedução razoável, ex.: nacionalidade), ausente (não encontrado).",
+        },
+    },
+    required: ["value", "confidence", "source"],
+    additionalProperties: false,
+};
+
+const contractDataSchema = {
+    type: "object",
+    properties: Object.fromEntries(CONTRACT_FIELD_KEYS.map((k) => [k, contractFieldSchema])),
+    required: CONTRACT_FIELD_KEYS,
+    additionalProperties: false,
+};
+
+// Baixa uma mídia do S3 e devolve o bloco de visão do Claude (ou null).
+async function mediaToVisionBlock(m) {
+    const baseMime = String(m.mimeType || "").split(";")[0].trim();
+    const isPdf = baseMime === "application/pdf";
+    const isImage = baseMime.startsWith("image/");
+    if (!isPdf && !isImage) return null;
+    const MAX_BYTES = isPdf ? 30 * 1024 * 1024 : 4.5 * 1024 * 1024;
+    try {
+        const resp = await fetch(m.url, { signal: AbortSignal.timeout(15000) });
+        if (!resp.ok) throw new Error(`HTTP ${resp.status}`);
+        const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length > MAX_BYTES) return null;
+        return isPdf
+            ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
+            : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } };
+    } catch (err) {
+        console.warn("[BOT] extração: mídia ignorada (download falhou):", err.message);
+        return null;
+    }
+}
+
+async function extractContractData({ contact, history = [], memory = null, documents = [] }) {
+    const model = process.env.MODEL || "claude-sonnet-5";
+
+    // Até 6 documentos (RG/CNH frente e verso, comprovantes...) como visão.
+    const blocks = [];
+    for (const m of documents.slice(0, 6)) {
+        const block = await mediaToVisionBlock(m);
+        if (block) blocks.push(block);
+    }
+
+    const transcript = pruneHistory(history, 2600)
+        .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 1500,
+        system: [
+            "Você extrai os dados cadastrais de um cliente para preencher uma PROCURAÇÃO",
+            "AD JUDICIA + contrato de honorários (ação previdenciária). As fontes são: os",
+            "DOCUMENTOS anexos (RG ou CNH — fonte primária para nome completo, RG, CPF e,",
+            "quando legível, endereço), a FICHA do atendimento e a CONVERSA (endereço,",
+            "estado civil, profissão).",
+            "",
+            "REGRAS:",
+            "- NUNCA invente ou chute. Campo não encontrado → value=\"\", source=\"ausente\", confidence=0.",
+            "- Nome: SEMPRE o nome completo como está no documento (não o apelido do WhatsApp).",
+            "- CPF: apenas dígitos formatados 000.000.000-00. RG: como está no documento, com órgão emissor/UF se visível (ex.: 12.345.678-9 SSP/PR).",
+            "- nacionalidade: se não dita, infira \"brasileiro\" ou \"brasileira\" pelo nome/documento (source=\"inferido\", confidence<=0.8).",
+            "- estado_civil: normalize para solteiro(a)/casado(a)/divorciado(a)/viúvo(a)/união estável, concordando com o gênero do cliente.",
+            "- profissao: como o cliente declarou, em minúsculas (ex.: \"motoboy\", \"auxiliar de produção\").",
+            "- Endereço: separe em rua (com tipo: Rua/Av./Travessa...), numero, bairro, cep (formato 00000-000), cidade, estado (nome do estado por extenso, ex.: \"Paraná\").",
+            "- Se documento e conversa divergirem (ex.: nome), prefira o DOCUMENTO e reduza a confidence do campo para <=0.6.",
+            "- Leitura ilegível/duvidosa no documento → confidence baixa (<=0.5), nunca chute dígitos.",
+        ].join("\n"),
+        output_config: {
+            format: { type: "json_schema", schema: contractDataSchema },
+        },
+        messages: [{
+            role: "user",
+            content: [
+                ...blocks,
+                {
+                    type: "text",
+                    text:
+                        `NOME NO PERFIL DO WHATSAPP: ${contact?.name ?? "(desconhecido)"}\n` +
+                        (memory ? `FICHA DO ATENDIMENTO:\n${clipText(memory, 1600)}\n\n` : "") +
+                        (transcript ? `CONVERSA:\n${transcript}\n\n` : "") +
+                        `Documentos anexados nesta mensagem: ${blocks.length}. Extraia os campos.`,
+                },
+            ],
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try {
+        out = JSON.parse(raw);
+    } catch {
+        throw new Error("extração de dados não é JSON válido");
+    }
+
+    const fields = {};
+    for (const key of CONTRACT_FIELD_KEYS) {
+        const f = out[key] ?? {};
+        fields[key] = {
+            value: String(f.value ?? "").trim(),
+            confidence: Math.min(Math.max(Number(f.confidence ?? 0), 0), 1),
+            source: ["documento", "conversa", "inferido", "ausente"].includes(f.source) ? f.source : "ausente",
+        };
+    }
+    // Validação de CPF em código: dígito verificador errado derruba a confiança
+    // (a IA às vezes lê um dígito trocado com convicção).
+    if (fields.cpf.value && !isValidCPF(fields.cpf.value)) {
+        fields.cpf.confidence = Math.min(fields.cpf.confidence, 0.3);
+    }
+
+    return { fields, documentsRead: blocks.length, usage: usageFrom(response, model) };
+}
+
+// ---------------------------------------------------------------------------
+// CONFIRMAÇÃO DOS DADOS DO CONTRATO (etapa anterior ao envio pra ZapSign).
+//
+// O app Next mandou ao cliente um RESUMO dos dados extraídos e pediu
+// confirmação. O público é humilde e às vezes semi-analfabeto: a resposta pode
+// ser "sim", "ta serto", "👍", um áudio, ou uma correção torta ("meu cep é
+// outro é 83700 alguma coisa"). Esta função interpreta a resposta e devolve
+// uma decisão fechada — NUNCA inventa correção que o cliente não deu.
+// ---------------------------------------------------------------------------
+const confirmSchema = {
+    type: "object",
+    properties: {
+        decision: {
+            type: "string",
+            enum: ["confirmado", "corrigir", "atendente", "nao_entendi"],
+            description:
+                "confirmado = o cliente disse que os dados estão certos (sim/ok/👍/'ta serto'/áudio confirmando); " +
+                "corrigir = ele apontou um dado ERRADO e deu (mesmo que parcialmente) o valor certo; " +
+                "atendente = ele pediu pessoa/ligação, disse que não sabe o dado (não sabe o CEP, não tem o documento), não sabe ler, ou a correção veio incompleta demais pra aproveitar; " +
+                "nao_entendi = a resposta não deixa claro nenhuma das anteriores.",
+        },
+        corrections: {
+            type: "array",
+            items: {
+                type: "object",
+                properties: {
+                    field: {
+                        type: "string",
+                        enum: ["name", "nacionalidade", "estado_civil", "profissao", "rg", "cpf", "rua", "numero", "bairro", "cep", "cidade", "estado"],
+                    },
+                    value: { type: "string", description: "O valor corrigido COMPLETO. Se o cliente deu só metade (ex.: CEP incompleto), NÃO preencha — use decision=atendente." },
+                },
+                required: ["field", "value"],
+                additionalProperties: false,
+            },
+            description: "Somente quando decision=corrigir. Apenas campos que o cliente corrigiu explicitamente.",
+        },
+        reply: {
+            type: "string",
+            description:
+                "decision=nao_entendi: UMA frase simples e acolhedora repetindo o pedido (linguagem fácil, sem jargão). " +
+                "decision=corrigir: frase curta confirmando a correção (o app reenvia o resumo em seguida). Nos demais casos, vazio.",
+        },
+    },
+    required: ["decision", "corrections", "reply"],
+    additionalProperties: false,
+};
+
+async function confirmContractReply({ contact, extracted, message = "", media = null }) {
+    const model = process.env.MODEL || "claude-sonnet-5";
+
+    let clientText = message;
+    if (media?.url && String(media.mimeType || "").startsWith("audio/")) {
+        try {
+            const transcript = await transcribeAudio(media);
+            if (transcript) clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
+        } catch (err) {
+            console.warn("[BOT] confirmação: transcrição falhou:", err.message);
+        }
+    }
+    if (!clientText?.trim()) {
+        // Sem texto interpretável (figurinha, imagem...) → não chuta.
+        return { decision: "nao_entendi", corrections: [], reply: "Só pra confirmar: os dados que te mandei estão certinhos? Pode responder só SIM, ou me falar o que está errado. 😊" };
+    }
+
+    const resumo = Object.entries(extracted || {})
+        .map(([k, f]) => `${k}: ${typeof f === "object" ? f.value : f}`)
+        .join("\n");
+
+    const response = await anthropic.messages.create({
+        model,
+        max_tokens: 500,
+        system: [
+            "Você interpreta a resposta de um cliente de WhatsApp a um pedido de CONFIRMAÇÃO",
+            "de dados cadastrais (para uma procuração). O público é simples, às vezes",
+            "semi-analfabeto: aceite variações tortas ('ta serto', 'issu mesmo', 'pode se'),",
+            "emojis (👍 = confirmado) e áudios transcritos.",
+            "",
+            "REGRAS:",
+            "- 'sim', 'ok', 'certo', 'isso', 'pode mandar', '👍', 'aham' → confirmado.",
+            "- Apontou dado errado E deu o valor completo → corrigir (liste em corrections).",
+            "- Disse que NÃO SABE um dado (CEP, número...), que não tem/não acha o documento,",
+            "  que não consegue, pediu ligação/pessoa, ou a correção veio incompleta → atendente.",
+            "- Mudou de assunto ou resposta ambígua → nao_entendi (com reply simples e gentil).",
+            "- NUNCA invente valor de correção. Na dúvida entre corrigir e atendente → atendente.",
+            "- CPF/CEP corrigidos: devolva só dígitos formatados (000.000.000-00 / 00000-000).",
+        ].join("\n"),
+        output_config: { format: { type: "json_schema", schema: confirmSchema } },
+        messages: [{
+            role: "user",
+            content:
+                `DADOS ENVIADOS PARA CONFERÊNCIA:\n${resumo}\n\n` +
+                `NOME DO CLIENTE: ${contact?.name ?? "(desconhecido)"}\n` +
+                `RESPOSTA DO CLIENTE:\n${clientText}`,
+        }],
+    });
+
+    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
+    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+    let out;
+    try { out = JSON.parse(raw); } catch { throw new Error("confirmação não é JSON válido"); }
+    return {
+        decision: ["confirmado", "corrigir", "atendente", "nao_entendi"].includes(out.decision) ? out.decision : "nao_entendi",
+        corrections: Array.isArray(out.corrections) ? out.corrections.filter((c) => c?.field && c?.value) : [],
+        reply: String(out.reply ?? "").trim(),
+        usage: usageFrom(response, model),
+    };
+}
+
+// ---------------------------------------------------------------------------
 // CÉREBRO — PASSO A: extrair a LIÇÃO de uma revisão humana.
 //
 // Roda uma vez por revisão, logo que o humano salva o julgamento. Lê a conversa
@@ -1820,7 +2101,7 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
 
 module.exports = {
     decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio,
-    distillLesson, consolidatePlaybook,
+    distillLesson, consolidatePlaybook, extractContractData, confirmContractReply,
     // Exportado para diagnóstico: permite conferir de fora qual prompt o bot
     // está usando (remoto do CRM ou o embutido de fallback) sem gastar uma
     // chamada ao modelo.
