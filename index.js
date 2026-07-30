@@ -1,6 +1,6 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook, extractContractData, confirmContractReply } = require("./bot");
+const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
@@ -187,60 +187,6 @@ app.post("/transcribe", async (req, res) => {
   } catch (err) {
     console.error("[BOT] Erro na transcrição:", err);
     res.status(500).json({ error: "transcribe_error", detail: String(err?.message ?? err) });
-  }
-});
-
-// EXTRAÇÃO DOS DADOS DA PROCURAÇÃO (integração ZapSign do app Next): lê a
-// ficha + conversa + documentos (RG/CNH via URLs pré-assinadas do S3) e devolve
-// os campos do KIT_PREV_CSS, cada um com { value, confidence, source }.
-// Body: { contact, history, memory?, documents: [{ url, mimeType }] }
-//   → { fields: { name, nacionalidade, ..., estado }, documentsRead, usage }
-app.post("/extract-contract-data", async (req, res) => {
-  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
-    return res.status(403).json({ error: "forbidden" });
-  }
-  const { contact, history, memory, documents } = req.body || {};
-  try {
-    const out = await extractContractData({
-      contact: contact ?? null,
-      history: Array.isArray(history) ? history : [],
-      memory: memory ?? null,
-      documents: Array.isArray(documents) ? documents : [],
-    });
-    const resumo = Object.entries(out.fields)
-      .map(([k, f]) => `${k}=${f.source}${f.value ? "" : "(vazio)"}`)
-      .join(" ");
-    console.log(`[BOT] extract-contract-data ${contact?.name ?? contact?.phone ?? "?"} (${out.documentsRead} docs): ${resumo}`);
-    res.json(out);
-  } catch (err) {
-    console.error("[BOT] Erro na extração de dados do contrato:", err);
-    // O app Next trata erro mandando a conversa pra revisão humana.
-    res.status(500).json({ error: "extract_error", detail: String(err?.message ?? err) });
-  }
-});
-
-// CONFIRMAÇÃO dos dados do contrato: interpreta a resposta do cliente ao
-// resumo (sim/correção/áudio/confuso) antes de gerar o doc na ZapSign.
-// Body: { contact, extracted, message?, media? }
-//   → { decision: confirmado|corrigir|atendente|nao_entendi, corrections, reply, usage }
-app.post("/confirm-contract-data", async (req, res) => {
-  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
-    return res.status(403).json({ error: "forbidden" });
-  }
-  const { contact, extracted, message, media } = req.body || {};
-  try {
-    const out = await confirmContractReply({
-      contact: contact ?? null,
-      extracted: extracted ?? {},
-      message: typeof message === "string" ? message : "",
-      media: media ?? null,
-    });
-    console.log(`[BOT] confirm-contract ${contact?.name ?? contact?.phone ?? "?"} → ${out.decision}${out.corrections.length ? ` (${out.corrections.map((c) => c.field).join(",")})` : ""}`);
-    res.json(out);
-  } catch (err) {
-    console.error("[BOT] Erro na confirmação de dados:", err);
-    // O app Next trata erro mandando pra revisão humana.
-    res.status(500).json({ error: "confirm_error", detail: String(err?.message ?? err) });
   }
 });
 
