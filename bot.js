@@ -1303,7 +1303,10 @@ async function decide({
 // A IA propõe a próxima mensagem; o humano revisa, edita e envia.
 // ---------------------------------------------------------------------------
 async function suggest({ contact, processInfo, history = [], memory = null, agentName = null }) {
-    const model = process.env.MODEL || "claude-sonnet-5";
+    // Haiku de propósito (pedido do Samuel, 07/08): a sugestão é um rascunho
+    // curto que o atendente revisa — não precisa do modelo do bot, e o custo
+    // por sugestão cai ~3×. Sobrescreva com SUGGEST_MODEL se mudar de ideia.
+    const model = process.env.SUGGEST_MODEL || "claude-haiku-4-5";
     const nome = contact?.name ? contact.name.split(" ")[0] : null;
 
     const transcript = pruneHistory(history, 2200)
