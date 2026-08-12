@@ -29,6 +29,59 @@ const anthropic = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
 });
 
+// ---------------------------------------------------------------------------
+// Wrapper de todas as chamadas ao Claude: retry com backoff para erros
+// transitórios (529 sobrecarregado, 429 rate limit, 500/503) e mensagem de
+// erro traduzida pro humano (saldo insuficiente, chave inválida, etc.) — o
+// erro cru do SDK chega até o /reply do index.js e do lá pro dashboard, então
+// vale a pena já sair legível daqui.
+// ---------------------------------------------------------------------------
+function classifyClaudeError(err) {
+    const status = err?.status;
+    const type = err?.error?.error?.type || err?.error?.type;
+    const rawMsg = err?.error?.error?.message || err?.message || String(err);
+    let friendly;
+    if (status === 529 || type === "overloaded_error") {
+        friendly = "Servidor da Anthropic sobrecarregado (529) — tente novamente em instantes.";
+    } else if (status === 429 || type === "rate_limit_error") {
+        friendly = "Limite de requisições da Anthropic atingido (429) — aguarde e tente novamente.";
+    } else if (status === 400 && /credit balance/i.test(rawMsg)) {
+        friendly = "Saldo insuficiente na conta Anthropic — adicione créditos na plataforma.";
+    } else if (status === 401 || type === "authentication_error") {
+        friendly = "Chave da API Anthropic inválida ou expirada (401).";
+    } else if (status === 403 || type === "permission_error") {
+        friendly = "Sem permissão para usar este modelo/recurso da Anthropic (403).";
+    } else if (typeof status === "number" && status >= 500) {
+        friendly = `Erro interno no servidor da Anthropic (${status}).`;
+    } else {
+        friendly = rawMsg;
+    }
+    const wrapped = new Error(friendly);
+    wrapped.status = status;
+    wrapped.claudeErrorType = type;
+    wrapped.isClaudeError = true;
+    wrapped.cause = err;
+    return wrapped;
+}
+
+async function callClaude(params, { retries = 3, baseDelayMs = 1000 } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            return await anthropic.messages.create(params);
+        } catch (err) {
+            lastErr = err;
+            const status = err?.status;
+            const retryable = status === 529 || status === 429 || status === 500 || status === 503;
+            if (!retryable || attempt === retries) break;
+            const delay = Math.round(baseDelayMs * 2 ** attempt + Math.random() * 300);
+            console.warn(`[BOT] Claude erro ${status} — tentativa ${attempt + 1}/${retries} em ${delay}ms`);
+            await new Promise((r) => setTimeout(r, delay));
+        }
+    }
+    throw classifyClaudeError(lastErr);
+}
+
 // Gemini só para transcrever áudio (Claude não recebe áudio).
 const genAI = process.env.GOOGLE_API_KEY
     ? new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY })
@@ -82,7 +135,7 @@ function pruneHistory(history, budget = HISTORY_TOKEN_BUDGET) {
 async function compactMemory(memory) {
     const model = process.env.MODEL_SMALL;
     try {
-        const response = await anthropic.messages.create({
+        const response = await callClaude({
             model,
             max_tokens: 700,
             system:
@@ -1219,7 +1272,7 @@ async function decide({
             : parts.join("\n\n"),
     });
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 8192,
         system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome }),
@@ -1313,7 +1366,7 @@ async function suggest({ contact, processInfo, history = [], memory = null, agen
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 500,
         system: [
@@ -1372,7 +1425,7 @@ async function summarize({ contact, history = [], memory = null }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 400,
         system: [
@@ -1411,7 +1464,7 @@ async function farewell({ contact, history, memory }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 300,
         system: [
@@ -1479,7 +1532,7 @@ async function followupDecision({ contact, history, memory, state }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 250,
         system: [
@@ -1572,7 +1625,7 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
         .join("\n");
 
     const isFinal = attempt >= maxAttempts;
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 350,
         system: [
@@ -1667,7 +1720,7 @@ async function distillLesson({ contact, history = [], memory = null, review }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : h.role === "nota" ? "Nota interna" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 700,
         system: [
@@ -1782,7 +1835,7 @@ const playbookSchema = {
 async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80 }) {
     const model = process.env.MODEL_PLAYBOOK || "claude-opus-4-8";
 
-    const response = await anthropic.messages.create({
+    const response = await callClaude({
         model,
         max_tokens: 8000,
         thinking: { type: "adaptive" },

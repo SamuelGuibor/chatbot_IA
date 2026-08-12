@@ -62,7 +62,15 @@ app.post("/reply", async (req, res) => {
     console.error("[BOT] Erro na IA:", err);
     // Falha da IA → o app Next joga na fila humana SEM mandar mensagem de
     // erro pro cliente. Um erro aqui nunca deixa o cliente falando sozinho.
-    res.status(500).json({ error: "ia_error", detail: String(err?.message ?? err) });
+    // detail já vem traduzido pro humano (ver classifyClaudeError em bot.js)
+    // quando o erro veio da Anthropic; claudeStatus/claudeErrorType dão pro
+    // dashboard distinguir "sobrecarga" de "sem saldo" de "chave inválida".
+    res.status(500).json({
+      error: "ia_error",
+      detail: String(err?.message ?? err),
+      claudeStatus: err?.status ?? null,
+      claudeErrorType: err?.claudeErrorType ?? null,
+    });
   }
 });
 
