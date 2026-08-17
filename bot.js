@@ -92,8 +92,12 @@ const MAX_AUDIO_BYTES = 18 * 1024 * 1024;
 // ---------------------------------------------------------------------------
 // Orçamento de tokens (estimativa ~3.5 chars/token para pt-BR)
 // ---------------------------------------------------------------------------
-const HISTORY_TOKEN_BUDGET = 1800; // teto do histórico dentro do prompt
-const HISTORY_MSG_MAX_CHARS = 600; // uma mensagem gigante não come o budget todo
+// 16/08/2026: 1800 podava o histórico pra ~11 mensagens nas conversas longas e
+// o bot re-perguntava o que o cliente já tinha respondido. O contexto real por
+// chamada (p90 ~21k tokens) está longe do limite do modelo, e o grosso do
+// prompt é cacheado — 5000 aqui custa centavos e preserva a conversa inteira.
+const HISTORY_TOKEN_BUDGET = 5000; // teto do histórico dentro do prompt
+const HISTORY_MSG_MAX_CHARS = 900; // uma mensagem gigante não come o budget todo
 const MEMORY_SOFT_CHARS = 2600;    // acima disto a ficha é compactada pela IA
 const MEMORY_HARD_CHARS = 4000;    // teto absoluto (fallback se a compactação falhar)
 
@@ -989,7 +993,11 @@ async function getStaticPrompt() {
             // (ou o fallback) e tenta de novo no próximo TTL.
             throw new Error("instruções vazias ou curtas demais");
         }
-        const text = [base, renderPlaybook(data.playbook)].filter(Boolean).join("\n\n");
+        // Exemplos revisados (16/08/2026): trechos reais de atendimentos
+        // julgados pela equipe, renderizados pelo CRM — entram DEPOIS do
+        // playbook, ainda dentro do bloco cacheado.
+        const examples = typeof data?.examples?.rendered === "string" ? data.examples.rendered : "";
+        const text = [base, renderPlaybook(data.playbook), examples].filter(Boolean).join("\n\n");
         brainCache = {
             text,
             fetchedAt: Date.now(),
@@ -999,6 +1007,7 @@ async function getStaticPrompt() {
         console.log(
             `[BRAIN] prompt carregado do CRM: instruções v${brainCache.version}` +
             (brainCache.playbookVersion ? `, playbook v${brainCache.playbookVersion} (${data.playbook.rulesCount} regras)` : ", sem playbook") +
+            (data?.examples?.count ? `, ${data.examples.count} exemplos revisados` : ", sem exemplos") +
             ` — ${text.length} chars`,
         );
         return text;
@@ -1023,10 +1032,33 @@ async function buildSystemBlocks(params) {
 // Áudio: Claude não aceita áudio — transcreve no Gemini e usa como texto.
 // (Também exposto no endpoint /transcribe para o botão "transcrever" do inbox.)
 // ---------------------------------------------------------------------------
+// 3 tentativas (16/08/2026): o Gemini falha esporadicamente (5xx/timeout) e
+// uma falha pontual virava "Não consegui ouvir direito seu áudio" pro cliente
+// — quando bastava tentar de novo. Backoff curto pra não estourar o timeout
+// do webhook do CRM.
+const TRANSCRIBE_MAX_ATTEMPTS = 3;
+const TRANSCRIBE_RETRY_DELAY_MS = 1200;
+
 async function transcribeAudio(media) {
     if (!media?.url || !media?.mimeType) return null;
     if (!genAI) throw new Error("transcrição indisponível: GOOGLE_API_KEY ausente");
 
+    let lastErr = null;
+    for (let attempt = 1; attempt <= TRANSCRIBE_MAX_ATTEMPTS; attempt++) {
+        try {
+            return await transcribeAudioOnce(media);
+        } catch (err) {
+            lastErr = err;
+            if (attempt < TRANSCRIBE_MAX_ATTEMPTS) {
+                console.warn(`[BOT] transcrição falhou (tentativa ${attempt}/${TRANSCRIBE_MAX_ATTEMPTS}): ${err.message} — tentando de novo.`);
+                await new Promise((r) => setTimeout(r, TRANSCRIBE_RETRY_DELAY_MS * attempt));
+            }
+        }
+    }
+    throw lastErr;
+}
+
+async function transcribeAudioOnce(media) {
     const res = await fetch(media.url, { signal: AbortSignal.timeout(15000) });
     if (!res.ok) throw new Error(`download da mídia falhou: HTTP ${res.status}`);
     const buf = Buffer.from(await res.arrayBuffer());
@@ -1123,6 +1155,7 @@ async function decide({
     history = [],
     message = "",
     media = null,
+    mediaList = null,
     memory = null,
     state = null,
     failCount = 0,
@@ -1178,76 +1211,111 @@ async function decide({
         effMemory = await compactMemory(effMemory);
     }
 
-    // Mídia do cliente:
-    //   - áudio      → transcrição via Gemini (Claude não aceita áudio);
-    //   - imagem/PDF → o Claude LÊ direto (bloco de visão anexado à mensagem).
-    //     O que fazer com o arquivo (confirmar, validar, pedir o próximo,
-    //     transferir com resumo) é decidido pelas INSTRUÇÕES + playbook — o
-    //     código não transfere mais automaticamente por causa de arquivo;
-    //   - outros tipos (vídeo, .docx...) → nota de sistema: a IA conduz sem
-    //     abrir o arquivo (pede foto/PDF se o conteúdo importar).
+    // Mídia do cliente (16/08/2026: agora o LOTE INTEIRO, não só o último):
+    //   - áudio      → transcrição via Gemini com retry (Claude não aceita áudio);
+    //   - imagem/PDF → o Claude LÊ direto (blocos de visão anexados à mensagem);
+    //   - outros tipos (vídeo, .docx...) → nota de sistema: a IA conduz SEM
+    //     contar o arquivo como documento recebido.
+    // O caso Rose (16/08): cliente mandou 8 arquivos (2 fotos da lesão, 4
+    // atestados, 2 vídeos) e a IA abriu SÓ o último — e a nota antiga ainda
+    // mandava "considerar os outros como RECEBIDOS", então ela confirmou um
+    // RG que nunca existiu. Agora todos os arquivos abríveis entram, e o que
+    // não entrou é declarado como NÃO LIDO — nunca presumido.
     let clientText = message;
-    let mediaBlock = null;
-    if (media?.url) {
-        const mt = String(media.mimeType || "");
-        if (mt.startsWith("audio/")) {
+    const mediaItems = Array.isArray(mediaList) && mediaList.length
+        ? mediaList
+        : media?.url ? [media] : [];
+    const mediaBlocks = [];
+    // Transcrições feitas aqui voltam na resposta ({ id, transcript }) para o
+    // CRM persistir em WhatsAppMessage.transcript — sem isso, nos turnos
+    // seguintes o histórico só mostrava "[anexo: áudio]" e o conteúdo sumia.
+    const transcripts = [];
+    const mediaNotes = [];
+    const MAX_MEDIA_BLOCKS = 8;                       // teto de arquivos abertos por chamada
+    const MAX_TOTAL_MEDIA_BYTES = 20 * 1024 * 1024;   // teto somado (request da API ~32MB já com base64)
+    let mediaBytes = 0;
+    let skippedForCaps = 0;
+
+    for (const item of mediaItems) {
+        if (!item?.url) continue;
+        const mt = String(item.mimeType || "");
+        // WhatsApp manda "audio/ogg; codecs=opus" — parâmetro após ";" derruba
+        // a validação de mimeType das APIs.
+        const baseMime = mt.split(";")[0].trim();
+        if (baseMime.startsWith("audio/")) {
             let transcript = null;
             try {
-                transcript = await transcribeAudio(media);
+                transcript = await transcribeAudio(item);
             } catch (err) {
-                console.error("[BOT] Falha ao transcrever áudio:", err.message);
+                console.error("[BOT] Falha ao transcrever áudio (após retries):", err.message);
             }
             if (transcript) {
                 clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
+                if (item.id) transcripts.push({ id: String(item.id), transcript });
             } else {
-                return {
-                    reply: "Não consegui ouvir direito seu áudio 😅 Pode repetir ou mandar por escrito?",
-                    replies: [],
-                    action: "continue",
-                    handoffReason: undefined,
-                    lookup: null,
-                    memory: String(effMemory ?? ""),
-                    state: String(effState ?? "saudacao"),
-                    intent: "outro",
-                    emotion: "neutro",
-                    urgent: false,
-                    understood: false,
-                    confidence: 0.3,
-                };
+                mediaNotes.push("[um áudio do cliente não pôde ser transcrito por falha técnica — NÃO afirme tê-lo ouvido; se o conteúdo parecer importante, peça com jeito para repetir por texto]");
             }
-        } else if (mt.startsWith("image/") || mt.split(";")[0].trim() === "application/pdf") {
-            // Baixa AGORA e manda como base64 (igual ao áudio): a URL do S3 é
-            // pré-assinada com 600s — se a mensagem cair numa fila de retry, a
-            // Anthropic receberia uma URL morta e a falha viraria loop. Também
-            // aplica teto de tamanho (limite da API: ~5MB imagem, 32MB PDF) e
-            // normaliza o mimeType (WhatsApp manda "audio/ogg; codecs=opus" e
-            // afins — parâmetro após ";" derruba a validação da API).
-            const baseMime = mt.split(";")[0].trim();
+        } else if (baseMime.startsWith("image/") || baseMime === "application/pdf") {
+            // Baixa AGORA e manda como base64: a URL do S3 é pré-assinada com
+            // 600s — se a mensagem cair numa fila de retry, a Anthropic
+            // receberia uma URL morta e a falha viraria loop. Teto por arquivo
+            // (limite da API: ~5MB imagem, 32MB PDF) e teto somado do lote.
             const isPdf = baseMime === "application/pdf";
             const MAX_BYTES = isPdf ? 30 * 1024 * 1024 : 4.5 * 1024 * 1024;
+            if (mediaBlocks.length >= MAX_MEDIA_BLOCKS) { skippedForCaps++; continue; }
             try {
-                const resp = await fetch(media.url, { signal: AbortSignal.timeout(15000) });
+                const resp = await fetch(item.url, { signal: AbortSignal.timeout(15000) });
                 if (!resp.ok) throw new Error(`download da mídia: HTTP ${resp.status}`);
                 const buf = Buffer.from(await resp.arrayBuffer());
                 if (buf.length > MAX_BYTES) {
-                    clientText = [clientText, `[o cliente enviou ${isPdf ? "um PDF" : "uma imagem"} grande demais para você abrir (${Math.round(buf.length / 1024 / 1024)}MB) — peça para reenviar menor (foto mais leve ou PDF só das páginas necessárias) e siga conforme as instruções]`]
-                        .filter(Boolean).join("\n");
-                } else {
-                    mediaBlock = isPdf
-                        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
-                        : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } };
-                    clientText = [clientText, `[o cliente enviou ${isPdf ? "o DOCUMENTO PDF" : "a IMAGEM"} anexo nesta mensagem — analise o conteúdo e conduza conforme as instruções]`]
-                        .filter(Boolean).join("\n");
+                    mediaNotes.push(`[o cliente enviou ${isPdf ? "um PDF" : "uma imagem"} grande demais para você abrir (${Math.round(buf.length / 1024 / 1024)}MB) — peça para reenviar menor (foto mais leve ou PDF só das páginas necessárias)]`);
+                    continue;
                 }
+                if (mediaBytes + buf.length > MAX_TOTAL_MEDIA_BYTES) { skippedForCaps++; continue; }
+                mediaBytes += buf.length;
+                mediaBlocks.push(isPdf
+                    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
+                    : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } });
             } catch (err) {
                 console.error("[BOT] Falha ao baixar imagem/PDF:", err.message);
-                clientText = [clientText, "[o cliente enviou um arquivo que não pôde ser aberto por falha técnica — confirme o recebimento, peça para reenviar se o conteúdo for necessário, e siga conforme as instruções]"]
-                    .filter(Boolean).join("\n");
+                mediaNotes.push("[um arquivo do cliente não pôde ser aberto por falha técnica — confirme o recebimento e, se o conteúdo for necessário, peça para reenviar]");
             }
         } else {
-            clientText = [clientText, `[o cliente enviou um arquivo (${mt || "tipo desconhecido"}) que você NÃO consegue abrir — se o conteúdo for necessário, peça uma foto ou PDF; senão, siga o fluxo normalmente]`]
-                .filter(Boolean).join("\n");
+            mediaNotes.push(`[o cliente enviou um arquivo (${baseMime || "tipo desconhecido"}) que você NÃO consegue abrir — NÃO conte este arquivo como documento recebido; se o conteúdo importar, peça uma foto ou PDF]`);
         }
+    }
+
+    // Só áudio no lote, nada transcrito e nenhum texto → não há NADA para a IA
+    // reagir. Pede para repetir (texto fixo de segurança). understood=false de
+    // propósito: alinhado à regra R4 do playbook — cliente que insiste em
+    // áudio inaudível cai pro atendente humano no 2º strike.
+    const hadAudio = mediaItems.some((i) => String(i?.mimeType || "").split(";")[0].trim().startsWith("audio/"));
+    if (hadAudio && !transcripts.length && !message && !mediaBlocks.length) {
+        return {
+            reply: "Não consegui ouvir direito seu áudio 😅 Pode repetir ou mandar por escrito?",
+            replies: [],
+            action: "continue",
+            handoffReason: undefined,
+            lookup: null,
+            memory: String(effMemory ?? ""),
+            state: String(effState ?? "saudacao"),
+            intent: "outro",
+            emotion: "neutro",
+            urgent: false,
+            understood: false,
+            confidence: 0.3,
+            transcripts: [],
+        };
+    }
+
+    if (mediaBlocks.length) {
+        mediaNotes.unshift(`[o cliente enviou ${mediaBlocks.length === 1 ? "o arquivo anexo" : `os ${mediaBlocks.length} arquivos anexos`} nesta mensagem — analise o conteúdo REAL de cada um e conduza conforme as instruções; NÃO presuma conteúdo que não está visível nem afirme ter recebido documento que não está entre os anexos]`);
+    }
+    if (skippedForCaps > 0) {
+        mediaNotes.push(`[além dos anexos abertos, o cliente enviou mais ${skippedForCaps} arquivo(s) que NÃO couberam nesta chamada — NÃO afirme tê-los lido; o atendente humano vê todos]`);
+    }
+    for (const note of mediaNotes) {
+        clientText = [clientText, note].filter(Boolean).join("\n\n");
     }
 
     // Histórico no formato do Claude: cliente = user; bot/atendente = assistant.
@@ -1263,12 +1331,12 @@ async function decide({
     if (lookupResult) {
         parts.push(`RESULTADO DA CONSULTA QUE VOCÊ PEDIU (${lookupResult.kind}):\n${JSON.stringify(lookupResult.data)}\nUse este resultado para responder AGORA (não peça a mesma consulta de novo).`);
     }
-    // Imagem/PDF entram como bloco de visão ANTES do texto, na mesma mensagem
-    // do cliente — o Claude enxerga o arquivo e o contexto juntos.
+    // Imagens/PDFs entram como blocos de visão ANTES do texto, na mesma
+    // mensagem do cliente — o Claude enxerga os arquivos e o contexto juntos.
     messages.push({
         role: "user",
-        content: mediaBlock
-            ? [mediaBlock, { type: "text", text: parts.join("\n\n") }]
+        content: mediaBlocks.length
+            ? [...mediaBlocks, { type: "text", text: parts.join("\n\n") }]
             : parts.join("\n\n"),
     });
 
@@ -1348,6 +1416,10 @@ async function decide({
         // (ex.: agradecimento pós-despedida). Sem esta flag, desfecho terminal
         // com reply vazio é tratado como erro pelo app Next (fallback + log).
         silent: Boolean(parsed.silent),
+        // Transcrições dos áudios do lote ({ id, transcript }) — o CRM persiste
+        // em WhatsAppMessage.transcript para o conteúdo sobreviver no histórico
+        // dos próximos turnos (e o botão "transcrever" não pagar IA de novo).
+        transcripts,
     };
 }
 

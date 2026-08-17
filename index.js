@@ -21,9 +21,10 @@ app.post("/reply", async (req, res) => {
 
   // priorOutcome ficava de fora do destructuring e era jogado fora — o prompt
   // manda o modelo checar priorOutcome.qualified, mas o dado nunca chegava.
-  const { contact, processInfo, history, message, media, memory, state, failCount, business, lookupResult, flows, priorOutcome } = req.body || {};
-  if ((!message || typeof message !== "string") && !media?.url) {
-    return res.status(400).json({ error: "message ou media obrigatórios" });
+  const { contact, processInfo, history, message, media, mediaList, memory, state, failCount, business, lookupResult, flows, priorOutcome } = req.body || {};
+  const hasMediaList = Array.isArray(mediaList) && mediaList.some((m) => m?.url);
+  if ((!message || typeof message !== "string") && !media?.url && !hasMediaList) {
+    return res.status(400).json({ error: "message, media ou mediaList obrigatórios" });
   }
 
   try {
@@ -33,6 +34,7 @@ app.post("/reply", async (req, res) => {
       history,
       message: typeof message === "string" ? message : "",
       media: media ?? null,
+      mediaList: hasMediaList ? mediaList : null,
       memory: memory ?? null,
       state: state ?? null,
       failCount: Number(failCount) || 0,
