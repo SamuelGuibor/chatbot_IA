@@ -82,6 +82,39 @@ async function callClaude(params, { retries = 3, baseDelayMs = 1000 } = {}) {
     throw classifyClaudeError(lastErr);
 }
 
+/** Remove cercas de código markdown (```json ... ```) — o modelo às vezes as usa mesmo com schema forçado. */
+function stripJsonFences(raw) {
+    const trimmed = String(raw ?? "").trim();
+    const fenced = trimmed.match(/^```(?:json)?\s*([\s\S]*?)\s*```$/i);
+    return fenced ? fenced[1].trim() : trimmed;
+}
+
+/**
+ * Chama o Claude esperando saída estruturada (output_config json_schema) com
+ * rede de segurança: strip de cercas markdown, 1 retry se o parse falhar
+ * (solavanco pontual do modelo/API) e log do texto bruto na falha final —
+ * sem isso, uma resposta mal-formada só dizia "não é JSON válido" sem
+ * mostrar o que realmente veio, impossível de diagnosticar depois.
+ */
+async function callClaudeStructured(params, context) {
+    let lastRaw = "";
+    for (let attempt = 1; attempt <= 2; attempt++) {
+        const response = await callClaude(params);
+        if (response.stop_reason === "refusal") {
+            throw new Error(`modelo recusou (refusal) [${context}]`);
+        }
+        const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
+        lastRaw = raw;
+        try {
+            return { data: JSON.parse(stripJsonFences(raw)), response };
+        } catch {
+            console.warn(`[BOT] ${context}: saída não é JSON válido (tentativa ${attempt}/2, stop_reason=${response.stop_reason}).`);
+        }
+    }
+    console.error(`[BOT] ${context}: JSON inválido após retry. Resposta bruta:`, clipText(lastRaw, 800));
+    throw new Error(`${context}: saída não é JSON válido`);
+}
+
 // Gemini só para transcrever áudio (Claude não recebe áudio).
 const genAI = process.env.GOOGLE_API_KEY
     ? new GoogleGenAI({ apiKey: process.env.GOOGLE_API_KEY })
@@ -1354,7 +1387,7 @@ async function decide({
             : parts.join("\n\n"),
     });
 
-    const response = await callClaude({
+    const { data: parsed, response } = await callClaudeStructured({
         model,
         max_tokens: 8192,
         system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature }),
@@ -1362,22 +1395,7 @@ async function decide({
             format: { type: "json_schema", schema: responseSchema },
         },
         messages,
-    });
-    if (response.stop_reason === "refusal") {
-        // Segurança do modelo recusou — cai pra fila humana sem quebrar.
-        throw new Error("modelo recusou a solicitação (refusal)");
-    }
-
-    const textBlock = response.content.find((b) => b.type === "text");
-    if (!textBlock?.text) throw new Error("resposta do Claude sem texto");
-
-    let parsed;
-    try {
-        parsed = JSON.parse(textBlock.text);
-    } catch (err) {
-        console.error("Erro convertendo JSON Claude:", textBlock.text);
-        throw err;
-    }
+    }, "decisão do bot");
 
     // Uso de tokens da chamada ao Claude — o app Next grava no log wa_bot e
     // calcula o gasto (semanal/mensal) no dashboard "Desempenho do Chatbot".
@@ -1618,7 +1636,7 @@ async function followupDecision({ contact, history, memory, state }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await callClaude({
+    const { data: out } = await callClaudeStructured({
         model,
         max_tokens: 250,
         system: [
@@ -1652,17 +1670,8 @@ async function followupDecision({ contact, history, memory, state }) {
                 (memory ? `Ficha da conversa: ${clipText(memory, 1200)}\n` : "") +
                 (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
         }],
-    });
+    }, "decisão de follow-up");
 
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try {
-        out = JSON.parse(raw);
-    } catch {
-        throw new Error("decisão de follow-up não é JSON válido");
-    }
     const action = out.action === "nudge" ? "nudge" : "close";
     return {
         action,
@@ -1711,7 +1720,7 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
         .join("\n");
 
     const isFinal = attempt >= maxAttempts;
-    const response = await callClaude({
+    const { data: out } = await callClaudeStructured({
         model,
         max_tokens: 350,
         system: [
@@ -1743,17 +1752,8 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
                 (memory ? `Ficha da conversa: ${clipText(memory, 1200)}\n` : "") +
                 (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
         }],
-    });
+    }, "mensagem de recuperação");
 
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try {
-        out = JSON.parse(raw);
-    } catch {
-        throw new Error("mensagem de recuperação não é JSON válido");
-    }
     return {
         message: String(out.message ?? "").trim(),
         pending: String(out.pending ?? "").trim(),
@@ -1835,7 +1835,7 @@ async function extractContractData({ contact, history = [], memory = null, docum
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 1500,
         system: [
@@ -1873,17 +1873,7 @@ async function extractContractData({ contact, history = [], memory = null, docum
                 },
             ],
         }],
-    });
-
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try {
-        out = JSON.parse(raw);
-    } catch {
-        throw new Error("extração de dados não é JSON válido");
-    }
+    }, "extração de dados do contrato");
 
     const fields = {};
     for (const key of CONTRACT_FIELD_KEYS) {
@@ -1972,7 +1962,7 @@ async function confirmContractReply({ contact, extracted, message = "", media = 
         .map(([k, f]) => `${k}: ${typeof f === "object" ? f.value : f}`)
         .join("\n");
 
-    const response = await anthropic.messages.create({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 500,
         system: [
@@ -1998,12 +1988,8 @@ async function confirmContractReply({ contact, extracted, message = "", media = 
                 `NOME DO CLIENTE: ${contact?.name ?? "(desconhecido)"}\n` +
                 `RESPOSTA DO CLIENTE:\n${clientText}`,
         }],
-    });
+    }, "confirmação de dados");
 
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try { out = JSON.parse(raw); } catch { throw new Error("confirmação não é JSON válido"); }
     return {
         decision: ["confirmado", "corrigir", "atendente", "nao_entendi"].includes(out.decision) ? out.decision : "nao_entendi",
         corrections: Array.isArray(out.corrections) ? out.corrections.filter((c) => c?.field && c?.value) : [],
@@ -2059,7 +2045,7 @@ async function distillLesson({ contact, history = [], memory = null, review }) {
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : h.role === "nota" ? "Nota interna" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const response = await callClaude({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 700,
         system: [
@@ -2097,17 +2083,7 @@ async function distillLesson({ contact, history = [], memory = null, review }) {
                 (memory ? `FICHA MONTADA PELO BOT: ${clipText(memory, 1200)}\n` : "") +
                 `\nCONVERSA:\n${transcript || "(sem histórico)"}`,
         }],
-    });
-
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try {
-        out = JSON.parse(raw);
-    } catch {
-        throw new Error("resposta da destilação não é JSON válido");
-    }
+    }, "destilação de lição");
 
     return {
         lesson: String(out.lesson ?? "").trim(),
@@ -2174,7 +2150,7 @@ const playbookSchema = {
 async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80 }) {
     const model = process.env.MODEL_PLAYBOOK || "claude-sonnet-5";
 
-    const response = await callClaude({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 8000,
         thinking: { type: "adaptive" },
@@ -2219,17 +2195,7 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
                         (l.states?.length ? ` (etapas: ${l.states.join(", ")})` : ""))
                     .join("\n"),
         }],
-    });
-
-    if (response.stop_reason === "refusal") throw new Error("modelo recusou (refusal)");
-
-    const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
-    let out;
-    try {
-        out = JSON.parse(raw);
-    } catch {
-        throw new Error("resposta da consolidação não é JSON válido");
-    }
+    }, "consolidação do playbook");
 
     const sections = Array.isArray(out.sections) ? out.sections : [];
     const rulesCount = sections.reduce((n, s) => n + (Array.isArray(s.rules) ? s.rules.length : 0), 0);
