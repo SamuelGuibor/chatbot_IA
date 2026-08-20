@@ -1,13 +1,13 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook } = require("./bot");
+const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook , extractContractData, confirmContractReply } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, service: "chatbot-whatsapp", model: process.env.MODEL || "claude-opus-4-8" });
+  res.json({ ok: true, service: "chatbot-whatsapp", model: process.env.MODEL || "claude-sonnet-5" });
 });
 
 // Body: { contact, processInfo, history, message, media?, memory?, state?,
@@ -21,7 +21,7 @@ app.post("/reply", async (req, res) => {
 
   // priorOutcome ficava de fora do destructuring e era jogado fora — o prompt
   // manda o modelo checar priorOutcome.qualified, mas o dado nunca chegava.
-  const { contact, processInfo, history, message, media, mediaList, memory, state, failCount, business, lookupResult, flows, priorOutcome } = req.body || {};
+  const { contact, processInfo, history, message, media, mediaList, memory, state, failCount, business, lookupResult, flows, priorOutcome, signature } = req.body || {};
   const hasMediaList = Array.isArray(mediaList) && mediaList.some((m) => m?.url);
   if ((!message || typeof message !== "string") && !media?.url && !hasMediaList) {
     return res.status(400).json({ error: "message, media ou mediaList obrigatórios" });
@@ -42,6 +42,7 @@ app.post("/reply", async (req, res) => {
       lookupResult: lookupResult ?? null,
       flows: Array.isArray(flows) ? flows : [],
       priorOutcome: priorOutcome ?? null,
+      signature: signature ?? null,
     });
     console.log(
       `[BOT] ${contact?.phone ?? "?"} → action=${decision.action} intent=${decision.intent}` +
@@ -200,6 +201,60 @@ app.post("/transcribe", async (req, res) => {
   }
 });
 
+// EXTRAÇÃO DOS DADOS DA PROCURAÇÃO (assinatura eletrônica própria): lê a
+// ficha + conversa + documentos (RG/CNH via URLs pré-assinadas do S3) e devolve
+// os campos do KIT_PREV_CSS, cada um com { value, confidence, source }.
+// Body: { contact, history, memory?, documents: [{ url, mimeType }] }
+//   → { fields: { name, nacionalidade, ..., estado }, documentsRead, usage }
+app.post("/extract-contract-data", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, history, memory, documents } = req.body || {};
+  try {
+    const out = await extractContractData({
+      contact: contact ?? null,
+      history: Array.isArray(history) ? history : [],
+      memory: memory ?? null,
+      documents: Array.isArray(documents) ? documents : [],
+    });
+    const resumo = Object.entries(out.fields)
+      .map(([k, f]) => `${k}=${f.source}${f.value ? "" : "(vazio)"}`)
+      .join(" ");
+    console.log(`[BOT] extract-contract-data ${contact?.name ?? contact?.phone ?? "?"} (${out.documentsRead} docs): ${resumo}`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BOT] Erro na extração de dados do contrato:", err);
+    // O app Next trata erro mandando a conversa pra revisão humana.
+    res.status(500).json({ error: "extract_error", detail: String(err?.message ?? err) });
+  }
+});
+
+// CONFIRMAÇÃO dos dados do contrato: interpreta a resposta do cliente ao
+// resumo (sim/correção/áudio/confuso) antes de gerar o documento.
+// Body: { contact, extracted, message?, media? }
+//   → { decision: confirmado|corrigir|atendente|nao_entendi, corrections, reply, usage }
+app.post("/confirm-contract-data", async (req, res) => {
+  if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
+    return res.status(403).json({ error: "forbidden" });
+  }
+  const { contact, extracted, message, media } = req.body || {};
+  try {
+    const out = await confirmContractReply({
+      contact: contact ?? null,
+      extracted: extracted ?? {},
+      message: typeof message === "string" ? message : "",
+      media: media ?? null,
+    });
+    console.log(`[BOT] confirm-contract ${contact?.name ?? contact?.phone ?? "?"} → ${out.decision}${out.corrections.length ? ` (${out.corrections.map((c) => c.field).join(",")})` : ""}`);
+    res.json(out);
+  } catch (err) {
+    console.error("[BOT] Erro na confirmação de dados:", err);
+    // O app Next trata erro mandando pra revisão humana.
+    res.status(500).json({ error: "confirm_error", detail: String(err?.message ?? err) });
+  }
+});
+
 // CÉREBRO passo A — extrai a lição de UMA revisão humana (chamado pelo CRM logo
 // que o supervisor salva o julgamento).
 // Body: { contact, history, memory?, review } → { lesson, states, section, usage }
@@ -256,5 +311,5 @@ app.post("/consolidate-playbook", async (req, res) => {
 });
 
 const port = process.env.PORT || 3003;
-const model = process.env.MODEL || "claude-opus-4-8";
+const model = process.env.MODEL || "claude-sonnet-5";
 app.listen(port, () => console.log(`chatbot-whatsapp up na porta ${port} com modelo ${model}`));
