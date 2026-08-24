@@ -310,6 +310,19 @@ function isValidCPF(raw) {
     return true;
 }
 
+// Data de HOJE no fuso de Brasília. O modelo NÃO sabe em que ano estamos (o
+// conhecimento dele tem corte no passado) e por isso chegou a tratar datas
+// reais de 2026 como "ainda não aconteceu", questionando o cliente e furando
+// o atendimento. Toda conta com data é feita AQUI, em código.
+function hojeBR() {
+    const partes = new Intl.DateTimeFormat("pt-BR", {
+        timeZone: "America/Sao_Paulo",
+        day: "2-digit", month: "2-digit", year: "numeric",
+    }).format(new Date());
+    const [d, m, y] = partes.split("/").map(Number);
+    return { d, m, y, br: partes, num: y * 10000 + m * 100 + d };
+}
+
 function validationNotes(text) {
     const notes = [];
     if (!text) return notes;
@@ -328,9 +341,17 @@ function validationNotes(text) {
 
     const dateMatch = text.match(/\b(\d{1,2})\/(\d{1,2})\/(\d{2,4})\b/);
     if (dateMatch) {
-        const [, d, m] = dateMatch;
-        if (Number(d) > 31 || Number(m) > 12) {
+        const d = Number(dateMatch[1]);
+        const m = Number(dateMatch[2]);
+        const yRaw = Number(dateMatch[3]);
+        const y = yRaw < 100 ? 2000 + yRaw : yRaw;
+        const hoje = hojeBR();
+        if (d < 1 || d > 31 || m < 1 || m > 12) {
             notes.push(`NOTA DO SISTEMA: a data ${dateMatch[0]} parece inválida.`);
+        } else if (y * 10000 + m * 100 + d > hoje.num) {
+            notes.push(`NOTA DO SISTEMA: hoje é ${hoje.br}. A data ${dateMatch[0]} está no FUTURO — provavelmente erro de digitação. Peça confirmação com gentileza.`);
+        } else {
+            notes.push(`NOTA DO SISTEMA: hoje é ${hoje.br}. A data ${dateMatch[0]} já passou e é válida. NÃO questione o ano nem diga que não aconteceu — siga a conversa.`);
         }
     }
 
@@ -897,6 +918,11 @@ DADOS DA CONVERSA (fonte única da verdade — NUNCA invente além disto):
 
 NOME DO CLIENTE: ${nome ?? "(ainda não informado — você não sabe o nome)"}
 SAUDAÇÃO DO HORÁRIO: ${business?.greeting ?? "olá"}
+DATA DE HOJE (Brasília): ${hojeBR().br} — esta é a data real, a única verdade
+sobre "hoje". Seu conhecimento interno sobre que ano é NÃO vale. Uma data só
+está no futuro se for POSTERIOR a esta. NUNCA diga que uma data "ainda não
+chegou"/"ainda não aconteceu" sem comparar com ela, e nunca corrija o ano que
+o cliente informou se aquela data já passou.
 
 DADOS DO SISTEMA:
 ${processInfo ? `- Cliente CADASTRADO no sistema.
