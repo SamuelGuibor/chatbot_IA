@@ -96,8 +96,9 @@ function stripJsonFences(raw) {
  * sem isso, uma resposta mal-formada só dizia "não é JSON válido" sem
  * mostrar o que realmente veio, impossível de diagnosticar depois.
  */
-async function callClaudeStructured(params, context) {
+async function callClaudeStructured(params, context, validate = null) {
     let lastRaw = "";
+    let lastOk = null;
     for (let attempt = 1; attempt <= 2; attempt++) {
         const response = await callClaude(params);
         if (response.stop_reason === "refusal") {
@@ -105,12 +106,28 @@ async function callClaudeStructured(params, context) {
         }
         const raw = response.content.find((b) => b.type === "text")?.text ?? "{}";
         lastRaw = raw;
+        let data;
         try {
-            return { data: JSON.parse(stripJsonFences(raw)), response };
+            data = JSON.parse(stripJsonFences(raw));
         } catch {
             console.warn(`[BOT] ${context}: saída não é JSON válido (tentativa ${attempt}/2, stop_reason=${response.stop_reason}).`);
+            continue;
         }
+        // JSON válido, mas semanticamente podre (ex.: raciocínio vazado no
+        // texto do cliente). Vale uma segunda tentativa antes de descartar:
+        // é sempre um solavanco pontual de amostragem, não um erro fixo.
+        const problem = validate ? validate(data) : null;
+        if (problem && attempt === 1) {
+            console.warn(`[BOT] ${context}: ${problem} (tentativa 1/2) — repetindo a chamada. Bruto:`, clipText(raw, 500));
+            lastOk = { data, response };
+            continue;
+        }
+        if (problem) {
+            console.error(`[BOT] ${context}: ${problem} — persistiu após retry. Bruto:`, clipText(raw, 800));
+        }
+        return { data, response };
     }
+    if (lastOk) return lastOk;
     console.error(`[BOT] ${context}: JSON inválido após retry. Resposta bruta:`, clipText(lastRaw, 800));
     throw new Error(`${context}: saída não é JSON válido`);
 }
@@ -223,9 +240,18 @@ const responseSchema = {
     type: "object",
     additionalProperties: false,
     properties: {
+        // PRIMEIRO campo de propósito (27/08/2026): sem lugar pra pensar, o
+        // modelo começava a deliberar DENTRO de "reply"/"replies" e o rascunho
+        // ia parar no WhatsApp do cliente ("categoria: mesmo assunto...",
+        // "action reply curta.", "let's write actual reply.}"). Agora ele tem
+        // um campo próprio pro raciocínio — que o código NUNCA envia.
+        rationale: {
+            type: "string",
+            description: "SEU RASCUNHO DE RACIOCÍNIO — escreva aqui ANTES de preencher qualquer outro campo. Este campo NUNCA é enviado ao cliente: é só seu. Use-o para pesar a etapa, as LIÇÕES APRENDIDAS e o que responder. Máximo 3 frases. NUNCA escreva raciocínio, rótulos ('categoria:', 'action', 'step') ou rascunho em inglês dentro de 'reply', 'replies' ou 'memory' — esses campos contêm APENAS texto pronto para o cliente ler.",
+        },
         reply: {
             type: "string",
-            description: "Mensagem ÚNICA a enviar ao cliente pelo WhatsApp (pt-BR). Vazia quando action=lookup OU quando você usa 'replies' (disparo do roteiro comercial inteiro).",
+            description: "Mensagem ÚNICA a enviar ao cliente pelo WhatsApp (pt-BR), pronta para ele ler. Vazia quando action=lookup OU quando você usa 'replies' (disparo do roteiro comercial inteiro). NUNCA coloque raciocínio aqui — isso vai no campo 'rationale'.",
         },
         replies: {
             type: "array",
@@ -289,6 +315,7 @@ const responseSchema = {
         },
     },
     required: [
+        "rationale",
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
         "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence", "optOut",
         "appliedRules", "silent",
@@ -1205,6 +1232,50 @@ function isJsonSkeleton(text) {
     return /"\s*:/.test(text) || /\[\s*\]/.test(text) || /^\s*[{}\[\],:]/.test(text);
 }
 
+// ---------------------------------------------------------------------------
+// 27/08/2026 (casos Sebastião Lourenço, Edivaldo, Victor): vazamento de
+// RACIOCÍNIO — diferente do vazamento de JSON de 29/07. Aqui a saída é JSON
+// perfeitamente válido, mas o modelo escreveu o rascunho do próprio
+// pensamento DENTRO do texto do cliente ("categoria: mesmo assunto...",
+// "action reply curta.", "step final", "let's write actual reply.}"). Como
+// são frases inteiras, passavam batido por looksLikeJsonFragment e cada uma
+// virava uma mensagem no WhatsApp. A correção de fundo é o campo `rationale`
+// no schema (dar onde pensar); isto aqui é a rede de segurança.
+// ---------------------------------------------------------------------------
+const REASONING_PATTERNS = [
+    // Rótulo interno em inglês abrindo a mensagem ("action reply curta.").
+    /^\s*(action|step|state|reply|replies|rationale|memory|final answer|thinking)/i,
+    // Rótulo de deliberação em pt-BR com dois-pontos ("categoria: ...").
+    /^\s*(categoria|avalia[çc][ãa]o|an[áa]lise|racioc[íi]nio|delibera[çc][ãa]o|decis[ãa]o|passo|nota interna|resumo interno)\s*[:=]/i,
+    // Atribuição de campo do schema no meio da prosa ("state=coleta_documentos").
+    /(state|action|closeCategory|handoffReason|flowName|replies|intent|silent|confidence|memory|rationale)\s*[:=]\s*["'\[]?[a-z_]/i,
+    // Rascunho em inglês ("let's write actual reply", "final json").
+    /(let'?s|final json|actual reply|i (should|will|need to)|we (should|need to))/i,
+    // Chave de JSON solta no meio do texto — mensagem de WhatsApp não tem { }.
+    /[{}]/,
+    // Fala SOBRE o cliente em 3ª pessoa (o bot fala COM ele, sempre "você").
+    /o cliente/i,
+    // Planejamento da própria resposta.
+    /(vou (responder|usar|mandar uma)|n[ãa]o repetir|melhor apenas|responder curto|sem repetir cobran[çc]a)/i,
+    // Degeneração de amostragem: alfabeto que não é o nosso (CJK/cirílico).
+    /[Ѐ-ӿ　-ヿ一-鿿가-힯]/,
+];
+
+// Texto que é rascunho de raciocínio, e não mensagem pronta pro cliente.
+function looksLikeReasoning(text) {
+    const t = String(text ?? "").trim();
+    if (!t) return false;
+    return REASONING_PATTERNS.some((re) => re.test(t));
+}
+
+// Etapas em que `replies` (várias mensagens em sequência) é legítimo: só o
+// disparo do roteiro comercial. Fora delas, `replies` preenchido é sinal de
+// saída degenerada — o roteiro é o ÚNICO caso previsto nas instruções.
+const SCRIPT_STATES = new Set([
+    "script_beneficio_1", "script_beneficio_2", "script_beneficio_3",
+    "script_honorarios", "script_fechamento", "pergunta_interesse",
+]);
+
 // Item de `replies` que é lixo de JSON, e não um bloco de mensagem real.
 function looksLikeJsonFragment(text) {
     const t = String(text).trim();
@@ -1416,12 +1487,27 @@ async function decide({
     const { data: parsed, response } = await callClaudeStructured({
         model,
         max_tokens: 8192,
+        // Thinking adaptativo EXPLÍCITO (27/08/2026): no claude-sonnet-5 omitir
+        // o campo já roda adaptativo, mas em Opus 4.7/4.8 omitir significa
+        // pensar ZERO — e modelo sem onde pensar é exatamente o que faz o
+        // raciocínio vazar pro texto do cliente. Como o modelo vem de MODEL
+        // (env), deixar explícito garante o comportamento em qualquer troca.
+        // display "omitted" (padrão): o raciocínio nem volta na resposta.
+        thinking: { type: "adaptive" },
         system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
         messages,
-    }, "decisão do bot");
+    }, "decisão do bot", (d) => {
+        // Raciocínio vazado no texto do cliente → vale repetir a chamada antes
+        // de descartar (ver callClaudeStructured). Só detecta aqui; quem limpa
+        // de fato é o filtro logo abaixo.
+        const textos = [d?.reply, ...(Array.isArray(d?.replies) ? d.replies : [])];
+        return textos.some((t) => typeof t === "string" && looksLikeReasoning(t))
+            ? "raciocínio da IA vazou no texto do cliente"
+            : null;
+    });
 
     // Uso de tokens da chamada ao Claude — o app Next grava no log wa_bot e
     // calcula o gasto (semanal/mensal) no dashboard "Desempenho do Chatbot".
@@ -1429,24 +1515,58 @@ async function decide({
     if (usage) {
         console.log(`[BOT] tokens: in=${usage.inputTokens} out=${usage.outputTokens} cacheRead=${usage.cacheReadTokens} cacheWrite=${usage.cacheWriteTokens}`);
     }
+    // max_tokens é o teto do output INTEIRO (thinking + JSON). Estourar corta a
+    // resposta no meio e é uma das formas de sair texto podre — se aparecer no
+    // log, é sinal de que 8192 ficou apertado.
+    if (response.stop_reason === "max_tokens") {
+        console.warn("[BOT] decisão truncada por max_tokens — o JSON pode ter vindo incompleto.");
+    }
 
-    // Filtro anti-vazamento de JSON (ver looksLikeJsonFragment). No `reply`
-    // único só o teste estrutural: mensagem curta legítima ("Ok!") não pode
-    // ser descartada por parecer token solto.
+    // O rascunho de raciocínio fica SÓ no log — nunca sai daqui pro cliente.
+    const rationale = String(parsed.rationale ?? "").trim();
+    if (rationale) console.log(`[BOT] raciocínio: ${clipText(rationale, 400)}`);
+
+    // Filtro anti-vazamento (ver looksLikeJsonFragment e looksLikeReasoning).
+    // No `reply` único, o teste de token solto NÃO se aplica: mensagem curta
+    // legítima ("Ok!") não pode ser descartada por parecer fragmento.
+    let leaked = false;
     const cleanReply = (() => {
         const r = sanitizeReply(parsed.reply);
-        return r && isJsonSkeleton(r) ? "" : r;
+        if (!r) return "";
+        if (isJsonSkeleton(r) || looksLikeReasoning(r)) { leaked = true; return ""; }
+        return r;
     })();
+
+    const estadoFinal = STATES.includes(parsed.state) ? parsed.state : String(effState ?? "saudacao");
     const rawReplies = Array.isArray(parsed.replies)
         ? parsed.replies.map((r) => sanitizeReply(r)).filter(Boolean)
         : [];
-    const cleanReplies = rawReplies.filter((r) => !looksLikeJsonFragment(r));
-    if (cleanReplies.length !== rawReplies.length || cleanReply !== sanitizeReply(parsed.reply)) {
-        console.warn(`[BOT] saída da IA continha fragmento(s) de JSON — descartados ${rawReplies.length - cleanReplies.length} item(ns) de replies.`);
+    let cleanReplies = rawReplies.filter((r) => !looksLikeJsonFragment(r) && !looksLikeReasoning(r));
+    if (cleanReplies.length !== rawReplies.length) {
+        // Uma sequência de mensagens é um bloco só: se um pedaço saiu podre, o
+        // resto da sequência também não é confiável — descarta tudo.
+        leaked = true;
+        cleanReplies = [];
+    }
+    // `replies` só existe para disparar o roteiro comercial de uma vez. Fora
+    // das etapas do roteiro, várias mensagens em sequência é saída degenerada.
+    if (cleanReplies.length && !SCRIPT_STATES.has(estadoFinal)) {
+        console.warn(`[BOT] replies com ${cleanReplies.length} item(ns) fora do roteiro (state=${estadoFinal}) — ignorado; usando só 'reply'.`);
+        cleanReplies = [];
+    }
+    if (leaked) {
+        console.error(
+            "[BOT] VAZAMENTO: a IA escreveu raciocínio/JSON no texto do cliente — descartado. " +
+            `state=${estadoFinal} | reply=${JSON.stringify(clipText(sanitizeReply(parsed.reply), 300))} | ` +
+            `replies=${JSON.stringify(rawReplies.map((r) => clipText(r, 200)))}`,
+        );
     }
 
     return {
         usage,
+        // Sinaliza o descarte pro CRM: sem texto o fluxo cai pra fila humana, e
+        // o motivo precisa aparecer no log em vez de "resposta vazia".
+        leaked,
         reply: cleanReply,
         replies: cleanReplies,
         action: ["continue", "qualify", "disqualify", "handoff", "lookup", "send_flow", "resolve"].includes(parsed.action)
@@ -1457,7 +1577,7 @@ async function decide({
         handoffReason: parsed.handoffReason ? String(parsed.handoffReason) : undefined,
         lookup: parsed.lookup && parsed.lookup !== "nenhum" ? String(parsed.lookup) : null,
         memory: String(parsed.memory ?? effMemory ?? "").slice(0, MEMORY_HARD_CHARS),
-        state: STATES.includes(parsed.state) ? parsed.state : String(effState ?? "saudacao"),
+        state: estadoFinal,
         intent: String(parsed.intent ?? "outro"),
         emotion: String(parsed.emotion ?? "neutro"),
         urgent: Boolean(parsed.urgent),
