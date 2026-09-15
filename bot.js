@@ -96,6 +96,17 @@ function stripJsonFences(raw) {
  * sem isso, uma resposta mal-formada só dizia "não é JSON válido" sem
  * mostrar o que realmente veio, impossível de diagnosticar depois.
  */
+// Config de thinking por modelo (15/09/2026): Haiku 4.5 NÃO aceita
+// `{ type: "adaptive" }` (400) — só o formato antigo com budget_tokens
+// (mín. 1024, < max_tokens). Sonnet 5 / Opus 5 usam adaptativo.
+// Sem thinking o modelo delibera dentro do `reply` (ver 27/08), por isso
+// o Haiku ganha um orçamento fixo em vez de rodar sem pensar.
+function thinkingFor(model, budgetTokens = 2048) {
+    return /haiku/i.test(String(model || ""))
+        ? { type: "enabled", budget_tokens: budgetTokens }
+        : { type: "adaptive" };
+}
+
 async function callClaudeStructured(params, context, validate = null) {
     let lastRaw = "";
     let lastOk = null;
@@ -1493,7 +1504,7 @@ async function decide({
         // raciocínio vazar pro texto do cliente. Como o modelo vem de MODEL
         // (env), deixar explícito garante o comportamento em qualquer troca.
         // display "omitted" (padrão): o raciocínio nem volta na resposta.
-        thinking: { type: "adaptive" },
+        thinking: thinkingFor(model),
         system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
@@ -2299,7 +2310,7 @@ async function consolidatePlaybook({ lessons = [], current = null, maxRules = 80
     const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 8000,
-        thinking: { type: "adaptive" },
+        thinking: thinkingFor(model),
         system: [
             "Você mantém o MANUAL DE CONDUTA de um bot de WhatsApp que atende vítimas de",
             "acidente (Auxílio-Acidente do INSS). Recebe o manual atual e um lote de lições",
