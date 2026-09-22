@@ -13,7 +13,7 @@ app.get("/health", (_req, res) => {
 // Body: { contact, processInfo, history, message, media?, memory?, state?,
 //         failCount?, business?, lookupResult? }             (ver bot.js)
 // Resposta: { reply, action, handoffReason?, lookup?, memory, state, intent,
-//             emotion, urgent, understood, confidence }
+//             emotion, understood, confidence }
 app.post("/reply", async (req, res) => {
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
@@ -46,7 +46,7 @@ app.post("/reply", async (req, res) => {
     });
     console.log(
       `[BOT] ${contact?.phone ?? "?"} → action=${decision.action} intent=${decision.intent}` +
-      ` state=${decision.state} urgent=${decision.urgent} understood=${decision.understood}` +
+      ` state=${decision.state} understood=${decision.understood}` +
       (decision.lookup ? ` lookup=${decision.lookup}` : "") +
       (decision.handoffReason ? ` (${decision.handoffReason})` : ""),
     );

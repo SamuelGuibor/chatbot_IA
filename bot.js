@@ -265,7 +265,7 @@ const responseSchema = {
         },
         reply: {
             type: "string",
-            description: "Mensagem ÚNICA a enviar ao cliente pelo WhatsApp (pt-BR), pronta para ele ler. Vazia quando action=lookup OU quando você usa 'replies' (disparo do roteiro comercial inteiro). NUNCA coloque raciocínio aqui — isso vai no campo 'rationale'.",
+            description: "Mensagem ÚNICA a enviar ao cliente pelo WhatsApp (pt-BR), pronta para ele ler. Vazia SOMENTE em 3 casos: action=lookup; você usou 'replies' (disparo do roteiro comercial); ou silent=true. Em QUALQUER outro caso escreva a mensagem — se não souber o que responder (ex.: o cliente respondeu a algo que um atendente perguntou e você não tem o contexto), NÃO devolva vazio: use action=handoff com handoffReason dizendo o motivo real. NUNCA comece com rótulos de autor como '[atendente ...]' ou '[mensagem automática ...]' — eles só existem no histórico. NUNCA coloque raciocínio aqui — isso vai no campo 'rationale'.",
         },
         replies: {
             type: "array",
@@ -318,7 +318,6 @@ const responseSchema = {
             type: "string",
             enum: ["neutro", "triste", "irritado", "ansioso", "confuso", "feliz"],
         },
-        urgent: { type: "boolean" },
         understood: { type: "boolean" },
         confidence: { type: "number" },
         optOut: {
@@ -332,13 +331,13 @@ const responseSchema = {
         },
         silent: {
             type: "boolean",
-            description: "true SOMENTE quando encerrar SEM enviar nenhuma mensagem é deliberadamente o correto — ex.: o cliente só agradeceu/se despediu DEPOIS que você já se despediu, e responder de novo seria repetir despedida. NUNCA use true num atendimento em andamento nem na primeira despedida. Quando silent=true, deixe reply vazio e use action=resolve ou disqualify.",
+            description: "true SOMENTE quando NÃO enviar mensagem é deliberadamente o correto: (a) o cliente só agradeceu/se despediu DEPOIS que você já se despediu → use action=resolve ou disqualify; (b) o cliente mandou só um 'ok', '👍', 'blz' ou reação confirmando algo que JÁ foi combinado (ex.: 'pode mandar quando voltar' → 'ok') e não há nada novo a dizer → use action=continue (a conversa segue aberta aguardando). NUNCA use true quando o cliente perguntou algo, mandou informação/documento nova ou está esperando resposta. Quando silent=true, deixe reply vazio.",
         },
     },
     required: [
         "rationale",
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
-        "lookup", "memory", "state", "intent", "emotion", "urgent", "understood", "confidence", "optOut",
+        "lookup", "memory", "state", "intent", "emotion", "understood", "confidence", "optOut",
         "appliedRules", "silent",
     ],
 };
@@ -949,25 +948,77 @@ O QUE VOCÊ NUNCA PODE FAZER:
 - NUNCA diga ao cliente para NÃO compartilhar senha, login ou documento com a
   gente, nem chame isso de "risco de segurança" (ver SENHAS E ACESSOS).
 - NUNCA contradiga, corrija ou desfaça o que um ATENDENTE HUMANO já disse ao
-  cliente nesta conversa (ver O QUE O ATENDENTE JÁ DISSE VALE).
+  cliente nesta conversa (ver ATENDENTE HUMANO NA CONVERSA).
 - NUNCA prometa que a Área do Cliente mostra documentos: ela mostra só a
   etapa do processo.
 
 ═══════════════════════════════════════
-O QUE O ATENDENTE JÁ DISSE VALE (mensagens marcadas [atendente humano]):
+ATENDENTE HUMANO NA CONVERSA (quem escreveu cada mensagem e como continuar):
 ═══════════════════════════════════════
 
-As mensagens com o prefixo [atendente humano] são da EQUIPE do escritório e
-mandam mais do que qualquer instrução genérica sua:
-- NUNCA contradiga, "corrija" ou suavize o que um atendente já disse ou
-  combinou (ex.: atendente disse que o hospital só entrega o prontuário
-  presencialmente e pediu para o cliente buscar → você NÃO diz que "dá pra
-  resolver por correspondência/procuração/INSS").
-- NUNCA prometa que o escritório consegue documentos no lugar do cliente. Se
-  ele diz que não consegue buscar, acolha em UMA frase e faça handoff.
-- Se a mensagem do cliente responde a uma pergunta do ATENDENTE (não sua),
-  registre na ficha e devolva ao atendente (handoff; closeCategory
-  "qualificado" se já era qualificado) — não abra conversa paralela.
+QUEM ESCREVEU CADA MENSAGEM DO HISTÓRICO:
+- [bot] → você mesmo.
+- [atendente: Nome] (ou [atendente humano]) → alguém da EQUIPE do escritório,
+  escrevendo à mão. Pode ter conversado com o cliente fora do seu fluxo.
+- [mensagem automática: tipo] → aviso disparado pelo sistema (recuperação,
+  lembrete de assinatura, código de verificação, andamento). Ninguém da equipe
+  escreveu; trate como se fosse sua.
+Esses rótulos existem SÓ no histórico: nunca escreva nenhum deles na resposta.
+
+O QUE O ATENDENTE JÁ DISSE VALE — a equipe conhece o caso e o que o escritório
+consegue ou não fazer. Ela manda mais do que qualquer instrução genérica sua:
+- NUNCA contradiga, "corrija", reabra ou suavize o que um atendente já disse
+  ou combinou com o cliente. Exemplo REAL do que NÃO fazer: o atendente disse
+  que o hospital só entrega o prontuário PRESENCIALMENTE, que não temos filial
+  na região e pediu para o cliente buscar — e o bot respondeu que "não precisa
+  ir pessoalmente, a gente resolve por correspondência/procuração/INSS". Isso
+  desautoriza a equipe e cria uma expectativa falsa.
+- NUNCA prometa que o escritório consegue documentos no lugar do cliente
+  (correspondência, procuração no hospital, "sai direto pelo INSS", "a gente
+  cuida de tudo"). Se o cliente disser que não consegue buscar o documento,
+  acolha em UMA frase e passe para o atendente (action="handoff",
+  handoffReason com o que ele disse) — não invente alternativa.
+- Você pode repetir/reforçar o que o atendente disse, com as mesmas
+  orientações. Nunca o contrário.
+
+CONVERSA QUE ESTAVA COM O ATENDENTE (a última mensagem enviada ao cliente foi
+de um [atendente: ...] e agora o cliente respondeu):
+Antes de responder, CRUZE três coisas: (1) o que o atendente pediu ou
+perguntou, (2) o que o cliente respondeu agora e (3) em que ponto do fluxo o
+caso está (ficha, state, se já é qualificado, quais documentos já vieram).
+Depois escolha UM destes caminhos, nesta ordem:
+
+A) O atendente PEDIU ALGO e o cliente ainda não entregou tudo → insista no que
+   foi pedido, de forma leve, usando as MESMAS palavras/orientações do
+   atendente. Ex.: atendente pediu "comprovante de residência e o nome do
+   hospital", cliente mandou só o hospital → agradeça, anote o hospital na
+   ficha e peça só o comprovante que falta. Mesmo limite da coleta: no
+   máximo 2 pedidos por item; depois anote como pendente e siga.
+
+B) O cliente entregou o que o atendente pediu (ou parte) e o caso tem um fluxo
+   seu para continuar → registre na ficha e SIGA O FLUXO DE ONDE ELE ESTÁ, sem
+   repetir o que já foi respondido. Ex.: lead já qualificado, o atendente
+   perguntou o hospital, o cliente respondeu só o hospital, mas o RG ainda não
+   veio → anote o hospital e continue a COLETA DE DOCUMENTOS pedindo o RG
+   (NUNCA pergunte o hospital de novo). Confira sempre na ficha e no histórico
+   o que já foi entregue antes de pedir qualquer coisa.
+
+C) O cliente só confirmou ("ok", "👍", "blz", reação) algo que já estava
+   combinado e não há nada novo a dizer → silent=true, action="continue",
+   reply vazio. Não transfira e não repita a última orientação.
+
+D) Nenhum dos casos acima: o atendente fez uma pergunta ou conversa cujo
+   contexto você não tem (ex.: "Podemos conversar rapidinho? Preciso tirar uma
+   dúvida com o senhor." e o cliente respondeu "Pode"/"Boa tarde"), o assunto
+   não está coberto pelas suas instruções, ou você não entendeu → devolva ao
+   atendente: action="handoff", closeCategory="qualificado" se já era
+   qualificado, e handoffReason dizendo o motivo real (ex.: "cliente respondeu
+   à pergunta do atendente Fulano — retomar"). Se couber, avise em UMA frase
+   curta que a equipe já vai continuar ("Perfeito! Já aviso aqui a equipe
+   para continuar com você 😊"). NUNCA invente qual era a dúvida do atendente.
+
+NUNCA devolva action="continue" com reply vazio sem silent=true: se não houver
+o que dizer, é o caminho D.
 
 ═══════════════════════════════════════
 SENHAS, DOCUMENTOS E ACESSOS DO CLIENTE (é seguro e é necessário):
@@ -1314,11 +1365,23 @@ function usageFrom(response, model) {
 // e já saiu mensagem com pontuação solta no início (";tendi...") em produção.
 // Remove esses artefatos sem tocar em texto bom.
 // ---------------------------------------------------------------------------
+// Rótulo de autor de cada turno enviado ao cliente no histórico. Bot, atendente
+// e mensagens automáticas vão TODOS como role "assistant" na API — sem o
+// rótulo a IA não distingue o que ela disse do que a equipe disse (e acaba
+// "respondendo" a uma pergunta do atendente cujo contexto não tem).
+function authorTag(h) {
+    if (h.role === "agent") return h.author ? `[atendente: ${h.author}]` : "[atendente]";
+    if (h.role === "system") return h.source ? `[mensagem automática: ${h.source}]` : "[mensagem automática]";
+    return "[bot]";
+}
+
 function sanitizeReply(text) {
     if (!text) return "";
     return String(text)
         .replace(/,?\s*\[nome\]/gi, "")
         .replace(/,?\s*\[saudação do horário\]/gi, "")
+        // Rótulo de autor do histórico que a IA copiou pro começo da resposta.
+        .replace(/^\s*(\[(bot|atendente[^\]]*|mensagem autom[aá]tica[^\]]*)\]\s*)+/i, "")
         .replace(/^[;,.:]+\s*/, "")
         .replace(/ {2,}/g, " ")
         .trim();
@@ -1556,7 +1619,6 @@ async function decide({
             state: String(effState ?? "saudacao"),
             intent: "outro",
             emotion: "neutro",
-            urgent: false,
             understood: false,
             confidence: 0.3,
             transcripts: [],
@@ -1577,11 +1639,15 @@ async function decide({
     // Poda por orçamento de tokens (mais recente primeiro) + clip por mensagem.
     const messages = pruneHistory(effHistory).map((h) => ({
         role: h.role === "client" ? "user" : "assistant",
-        content: h.role === "agent" ? `[atendente humano] ${h.text}` : h.text,
+        content: h.role === "client" ? h.text : `${authorTag(h)} ${h.text}`,
     })).filter((m) => m.content);
 
     // Mensagem atual + notas de validação do sistema.
     const parts = [clientText || "(mensagem vazia)"];
+    const lastOut = [...(effHistory || [])].reverse().find((h) => h.role !== "client");
+    if (lastOut && lastOut.role !== "bot") {
+        parts.push(`[CONTEXTO DO SISTEMA: a última mensagem enviada ao cliente antes desta foi ${authorTag(lastOut)}, NÃO sua. O cliente provavelmente está respondendo a ela — siga o bloco "CONVERSA QUE ESTAVA COM O ATENDENTE" das instruções.]`);
+    }
     for (const note of validationNotes(clientText)) parts.push(note);
     if (lookupResult) {
         parts.push(`RESULTADO DA CONSULTA QUE VOCÊ PEDIU (${lookupResult.kind}):\n${JSON.stringify(lookupResult.data)}\nUse este resultado para responder AGORA (não peça a mesma consulta de novo).`);
@@ -1691,7 +1757,6 @@ async function decide({
         state: estadoFinal,
         intent: String(parsed.intent ?? "outro"),
         emotion: String(parsed.emotion ?? "neutro"),
-        urgent: Boolean(parsed.urgent),
         understood: parsed.understood !== false,
         confidence: Math.min(Math.max(Number(parsed.confidence ?? 0.8), 0), 1),
         optOut: Boolean(parsed.optOut),
