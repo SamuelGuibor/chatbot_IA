@@ -958,12 +958,17 @@ ATENDENTE HUMANO NA CONVERSA (quem escreveu cada mensagem e como continuar):
 
 QUEM ESCREVEU CADA MENSAGEM DO HISTÓRICO:
 - [bot] → você mesmo.
-- [atendente: Nome] (ou [atendente humano]) → alguém da EQUIPE do escritório,
-  escrevendo à mão. Pode ter conversado com o cliente fora do seu fluxo.
+- [atendente] → alguém da EQUIPE do escritório, escrevendo à mão. Pode ter
+  conversado com o cliente fora do seu fluxo.
 - [mensagem automática: tipo] → aviso disparado pelo sistema (recuperação,
   lembrete de assinatura, código de verificação, andamento). Ninguém da equipe
   escreveu; trate como se fosse sua.
 Esses rótulos existem SÓ no histórico: nunca escreva nenhum deles na resposta.
+NUNCA cite o NOME de um atendente ou de qualquer pessoa da equipe na mensagem
+ao cliente — nem se o nome aparecer no histórico (assinatura do próprio
+atendente, "aqui é o Fulano", nome escrito pelo cliente). O escritório fala com
+UMA voz: diga "nossa equipe", "o responsável pelo seu caso", "aqui do
+escritório". Nome próprio na resposta, só o do CLIENTE.
 
 O QUE O ATENDENTE JÁ DISSE VALE — a equipe conhece o caso e o que o escritório
 consegue ou não fazer. Ela manda mais do que qualquer instrução genérica sua:
@@ -982,7 +987,7 @@ consegue ou não fazer. Ela manda mais do que qualquer instrução genérica sua
   orientações. Nunca o contrário.
 
 CONVERSA QUE ESTAVA COM O ATENDENTE (a última mensagem enviada ao cliente foi
-de um [atendente: ...] e agora o cliente respondeu):
+de um [atendente] e agora o cliente respondeu):
 Antes de responder, CRUZE três coisas: (1) o que o atendente pediu ou
 perguntou, (2) o que o cliente respondeu agora e (3) em que ponto do fluxo o
 caso está (ficha, state, se já é qualificado, quais documentos já vieram).
@@ -1370,7 +1375,9 @@ function usageFrom(response, model) {
 // rótulo a IA não distingue o que ela disse do que a equipe disse (e acaba
 // "respondendo" a uma pergunta do atendente cujo contexto não tem).
 function authorTag(h) {
-    if (h.role === "agent") return h.author ? `[atendente: ${h.author}]` : "[atendente]";
+    // Sem nome: o CRM não manda mais quem escreveu (23/09/2026). O bot citava
+    // o atendente pelo nome na resposta ao cliente; o escritório fala com UMA voz.
+    if (h.role === "agent") return "[atendente]";
     if (h.role === "system") return h.source ? `[mensagem automática: ${h.source}]` : "[mensagem automática]";
     return "[bot]";
 }
@@ -1781,7 +1788,9 @@ async function decide({
 // SUGESTÃO DE RESPOSTA para o ATENDENTE HUMANO (agent-assist).
 // A IA propõe a próxima mensagem; o humano revisa, edita e envia.
 // ---------------------------------------------------------------------------
-async function suggest({ contact, processInfo, history = [], memory = null, agentName = null }) {
+// agentName ainda chega do CRM, mas NÃO vai ao prompt (23/09/2026): a
+// sugestão não deve citar o nome de ninguém da equipe.
+async function suggest({ contact, processInfo, history = [], memory = null }) {
     // Haiku de propósito (pedido do Samuel, 07/08): a sugestão é um rascunho
     // curto que o atendente revisa — não precisa do modelo do bot, e o custo
     // por sugestão cai ~3×. Sobrescreva com SUGGEST_MODEL se mudar de ideia.
@@ -1810,6 +1819,7 @@ async function suggest({ contact, processInfo, history = [], memory = null, agen
                     "- Responda à ÚLTIMA mensagem do cliente; se houver pergunta pendente, responda-a.",
                     "- NUNCA prometa prazos, ligações, valores ou aprovação do benefício.",
                     "- NUNCA revele CPF, RG, endereço ou dados sensíveis.",
+                    "- NUNCA cite o nome de um atendente ou de alguém da equipe: fale como o escritório (\"nossa equipe\", \"aqui do escritório\").",
                     "- NUNCA invente status do processo além do que está nos dados.",
                     "- Não dê aconselhamento jurídico específico.",
                     "- Responda SOMENTE com o texto da mensagem sugerida, sem aspas nem preâmbulo.",
@@ -1820,7 +1830,6 @@ async function suggest({ contact, processInfo, history = [], memory = null, agen
                 type: "text",
                 text: [
                     `Nome do cliente: ${nome ?? "não informado"}`,
-                    agentName ? `Nome do atendente: ${agentName}` : null,
                     processInfo
                         ? `Cadastro: SIM — nome ${processInfo.name ?? "—"}, etapa "${processInfo.etapa ?? "—"}", serviço ${processInfo.service ?? "—"}.`
                         : "Cadastro: número sem vínculo no sistema.",
