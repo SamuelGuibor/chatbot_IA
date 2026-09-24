@@ -1096,7 +1096,7 @@ REGRAS IMPORTANTES:
 // ---------------------------------------------------------------------------
 // Bloco DINÂMICO do system prompt — tudo que muda por conversa/mensagem.
 // ---------------------------------------------------------------------------
-function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows, priorOutcome, signature }) {
+function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows, priorOutcome, signature, conversationFacts }) {
     const nome = contact?.name ? contact.name.split(" ")[0] : null;
 
     const flowsList = Array.isArray(flows) && flows.length
@@ -1153,12 +1153,24 @@ REGRAS ENQUANTO A ASSINATURA ESTIVER PENDENTE:
 - Se ele disser que JÁ ASSINOU, que não conseguiu, que não sabe mexer, que quer desistir, ou pedir pra falar com alguém: action="handoff" imediatamente (handoffReason explicando).
 - Assunto que não é o documento/assinatura: responda em UMA frase e ofereça o atendente (handoff se ele aceitar ou insistir).
 ` : ""}
+${conversationFacts && (conversationFacts.docsReceived > 0 || conversationFacts.registeredClient) ? `ESTE ATENDIMENTO (sinais que mudam o desfecho correto):
+${conversationFacts.docsReceived > 0 ? `- O cliente JÁ ENVIOU ${conversationFacts.docsReceived} arquivo(s) nesta conversa (foto/PDF/áudio).` : ""}
+${conversationFacts.registeredClient ? "- O número é de um CLIENTE CADASTRADO (tem processo no sistema)." : ""}
+Nestes casos NÃO use action="resolve" para fechar o assunto: o caso precisa de
+andamento humano. Agradeça em UMA frase e use action="handoff" com
+handoffReason dizendo o que chegou/o que ele pediu (ex.: "prontuário recebido —
+dar andamento"). "resolve" só vale para dúvida simples que você mesma respondeu
+por completo e que não deixa nada pendente para a equipe.
+` : ""}
 FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
 ${memory || "(vazia — conversa nova)"}
 
 ETAPA ATUAL DA CONVERSA: ${state || "saudacao"}
 
 Tentativas seguidas sem entender até agora: ${failCount || 0}.
+${(failCount || 0) >= 1 ? `ATENÇÃO: você JÁ não entendeu a mensagem anterior deste cliente. Se também não
+entender esta, NÃO peça para repetir de novo — passe para a equipe com
+action="handoff" e handoffReason="IA não entendeu o cliente 2x seguidas".` : ""}
 ${business && !business.open ? `HORÁRIO: estamos FORA do horário comercial. Faça a triagem normalmente,
 mas ao transferir avise: "Nossa equipe responderá ${business.reopens}."` : ""}
 `.trim();
@@ -1487,6 +1499,7 @@ async function decide({
     lookupResult = null,
     flows = [],
     priorOutcome = null,
+    conversationFacts = null,
     signature = null,
 }) {
     const model = process.env.MODEL || "claude-sonnet-5";
@@ -1678,7 +1691,7 @@ async function decide({
         // (env), deixar explícito garante o comportamento em qualquer troca.
         // display "omitted" (padrão): o raciocínio nem volta na resposta.
         thinking: thinkingFor(model),
-        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature }),
+        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature, conversationFacts }),
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
