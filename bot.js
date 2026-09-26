@@ -25,9 +25,81 @@
 const Anthropic = require("@anthropic-ai/sdk");
 const { GoogleGenAI } = require("@google/genai");
 
+// maxRetries 0 (26/09/2026): o retry é do callClaude (com classificação do
+// erro e respeitando o prazo do CRM). Com o padrão do SDK (2) empilhavam
+// retries do SDK × callClaude × callClaudeStructured numa decisão que o CRM
+// já tinha abandonado aos 45 s. O timeout GLOBAL é 120 s, e não o do /reply:
+// /consolidate-playbook (8000 tokens + thinking) e /distill-lesson são
+// longos. O prazo curto do /reply vai por requisição (callClaude).
 const anthropic = new Anthropic({
     apiKey: process.env.ANTHROPIC_API_KEY,
+    maxRetries: 0,
+    timeout: 120_000,
 });
+
+// ---------------------------------------------------------------------------
+// Prazo e aborto do /reply (26/09/2026). O CRM espera 45 s por tentativa e
+// manda o orçamento no header x-bot-budget-ms (ver index.js). Estourado o
+// prazo, ou se o CRM desconectar, o trabalho em andamento é abortado e o
+// /reply responde 504, que o CRM conta como timeout. Antes o micro seguia
+// pagando Claude/Gemini por uma resposta que ninguém ia ler.
+// ---------------------------------------------------------------------------
+function deadlineError(message = "prazo do CRM esgotado") {
+    const err = new Error(message);
+    err.name = "DeadlineError";
+    err.isDeadline = true;
+    return err;
+}
+
+/** Erro de prazo a partir de um sinal abortado (o motivo vem do index.js). */
+function abortedError(signal) {
+    const reason = signal?.reason;
+    return reason?.isDeadline ? reason : deadlineError(reason?.message || "chamada abortada");
+}
+
+// Sem nova tentativa com menos que isto no prazo: a resposta não chegaria a
+// tempo no CRM e a chamada seria paga à toa.
+const MIN_RETRY_WINDOW_MS = 5_000;
+
+function hasTimeFor(deadline, ms) {
+    return !deadline || deadline - Date.now() >= ms;
+}
+
+/** setTimeout que acorda cedo (com erro de prazo) se o sinal abortar. */
+function sleepOrAbort(ms, signal) {
+    if (signal?.aborted) return Promise.reject(abortedError(signal));
+    return new Promise((resolve, reject) => {
+        const onAbort = () => {
+            clearTimeout(timer);
+            reject(abortedError(signal));
+        };
+        const timer = setTimeout(() => {
+            signal?.removeEventListener("abort", onAbort);
+            resolve();
+        }, ms);
+        signal?.addEventListener("abort", onAbort, { once: true });
+    });
+}
+
+/**
+ * Sinal que aborta quando o `parent` aborta OU depois de `ms`. Feito à mão
+ * porque AbortSignal.any exige Node ≥ 20.3 e o engines do package é >=18.18.
+ * Chame cleanup() no fim para soltar o timer e o listener.
+ */
+function linkedSignal(parent, ms) {
+    const controller = new AbortController();
+    const onAbort = () => controller.abort(parent.reason);
+    if (parent?.aborted) controller.abort(parent.reason);
+    else parent?.addEventListener("abort", onAbort, { once: true });
+    const timer = ms ? setTimeout(() => controller.abort(new Error(`tempo esgotado (${ms} ms)`)), ms) : null;
+    return {
+        signal: controller.signal,
+        cleanup() {
+            if (timer) clearTimeout(timer);
+            parent?.removeEventListener("abort", onAbort);
+        },
+    };
+}
 
 // ---------------------------------------------------------------------------
 // Wrapper de todas as chamadas ao Claude: retry com backoff para erros
@@ -64,19 +136,38 @@ function classifyClaudeError(err) {
     return wrapped;
 }
 
-async function callClaude(params, { retries = 3, baseDelayMs = 1000 } = {}) {
+// `deadline` (epoch ms) e `signal` vêm do /reply: cada chamada leva como
+// timeout o que sobra do prazo, e o sinal para abortar. Sem os dois (cron,
+// revisão da IA, agent-assist) vale só o timeout global de 120 s.
+async function callClaude(params, { retries = 3, baseDelayMs = 1000, deadline, signal } = {}) {
     let lastErr;
     for (let attempt = 0; attempt <= retries; attempt++) {
+        if (signal?.aborted) throw abortedError(signal);
+        if (deadline && deadline - Date.now() <= 0) throw deadlineError();
+        // Só as chaves definidas: `timeout: undefined` no spread do SDK
+        // apagaria o timeout global.
+        const requestOptions = {};
+        if (deadline) requestOptions.timeout = Math.max(1000, deadline - Date.now());
+        if (signal) requestOptions.signal = signal;
         try {
-            return await anthropic.messages.create(params);
+            return await anthropic.messages.create(params, requestOptions);
         } catch (err) {
+            // Abortado pelo index.js (prazo ou CRM desconectou) ou timeout da
+            // requisição que já usava o resto do prazo: vira erro de prazo
+            // (504), sem nova tentativa.
+            if (signal?.aborted) throw abortedError(signal);
+            if (deadline && err instanceof Anthropic.APIConnectionTimeoutError) throw deadlineError();
             lastErr = err;
             const status = err?.status;
             const retryable = status === 529 || status === 429 || status === 500 || status === 503;
             if (!retryable || attempt === retries) break;
             const delay = Math.round(baseDelayMs * 2 ** attempt + Math.random() * 300);
+            if (!hasTimeFor(deadline, delay + MIN_RETRY_WINDOW_MS)) {
+                console.warn(`[BOT] Claude erro ${status} — sem tempo no prazo do CRM para nova tentativa.`);
+                break;
+            }
             console.warn(`[BOT] Claude erro ${status} — tentativa ${attempt + 1}/${retries} em ${delay}ms`);
-            await new Promise((r) => setTimeout(r, delay));
+            await sleepOrAbort(delay, signal);
         }
     }
     throw classifyClaudeError(lastErr);
@@ -120,13 +211,20 @@ function addRawUsage(acc, usage) {
 // O retry abaixo (JSON inválido ou raciocínio vazado) é uma SEGUNDA chamada
 // paga: o usage devolvido é a soma de todas as tentativas, não só a final
 // (26/09/2026 — antes o gasto da 1ª tentativa sumia da conta do CRM).
-async function callClaudeStructured(params, context, validate = null) {
+// `deadline`/`signal`: ver callClaude. Sem tempo para a 2ª tentativa, fica a
+// 1ª (se o JSON era válido) ou o erro, sem pagar uma chamada que chegaria
+// depois de o CRM desistir.
+async function callClaudeStructured(params, context, validate = null, { deadline, signal } = {}) {
     let lastRaw = "";
     let lastOk = null;
     let totalUsage = null;
     const withTotal = (response) => (totalUsage ? { ...response, usage: totalUsage } : response);
     for (let attempt = 1; attempt <= 2; attempt++) {
-        const response = await callClaude(params);
+        if (attempt > 1 && !hasTimeFor(deadline, MIN_RETRY_WINDOW_MS)) {
+            console.warn(`[BOT] ${context}: sem tempo no prazo do CRM para a 2ª tentativa.`);
+            break;
+        }
+        const response = await callClaude(params, { deadline, signal });
         totalUsage = addRawUsage(totalUsage, response.usage);
         if (response.stop_reason === "refusal") {
             throw new Error(`modelo recusou (refusal) [${context}]`);
@@ -212,8 +310,10 @@ function pruneHistory(history, budget = HISTORY_TOKEN_BUDGET) {
  * TODOS os fatos (reescritos de forma densa, uma linha por fato). O resultado
  * compactado volta no campo `memory` da resposta e é PERSISTIDO pelo app Next,
  * então a compactação acontece no máximo uma vez por "estouro".
+ * Roda dentro do prazo do /reply (`deadline`/`signal`): falhou ou abortou, vai
+ * o corte duro, e a decisão logo depois é quem responde pelo prazo.
  */
-async function compactMemory(memory) {
+async function compactMemory(memory, { deadline, signal } = {}) {
     const model = process.env.MODEL_SMALL;
     try {
         const response = await callClaude({
@@ -226,7 +326,7 @@ async function compactMemory(memory) {
                 "sem comentários nem repetições. Máximo de 1200 caracteres. " +
                 "Responda SOMENTE com a ficha compactada.",
             messages: [{ role: "user", content: memory }],
-        });
+        }, { deadline, signal });
         const text = response.content.find((b) => b.type === "text")?.text?.trim();
         if (text) {
             console.log(`[BOT] Ficha compactada: ${memory.length} → ${text.length} chars.`);
@@ -949,6 +1049,15 @@ CATEGORIAS DE ENCERRAMENTO (campo closeCategory):
 Preencha closeCategory sempre que qualify/disqualify/handoff/resolve; use
 "nenhum" quando action=continue/lookup/send_flow.
 
+QUANDO **NÃO** USAR action="resolve": se os DADOS DA CONVERSA mostrarem que o
+cliente ENVIOU ARQUIVO nesta conversa (prontuário, laudo, RG, exame...) ou que
+o número é de um CLIENTE CADASTRADO, o assunto NÃO está resolvido — alguém da
+equipe precisa dar andamento. Nesses casos: agradeça em UMA frase e use
+action="handoff" com handoffReason dizendo o que chegou ("prontuário recebido —
+dar andamento", "cliente cadastrado perguntou sobre a perícia"). "resolve" fica
+só para a dúvida simples que você respondeu por completo e que não deixa nada
+pendente para ninguém.
+
 ═══════════════════════════════════════
 O QUE VOCÊ NUNCA PODE FAZER:
 ═══════════════════════════════════════
@@ -1110,6 +1219,38 @@ REGRAS IMPORTANTES:
 `.trim();
 
 // ---------------------------------------------------------------------------
+// Bloco "ESTE ATENDIMENTO" — só FATOS do atendimento atual (conversationFacts).
+//
+// 26/09/2026 (auditoria do WhatsApp, D11): até aqui este bloco trazia fixa a
+// regra "cliente cadastrado ou arquivo recebido → NUNCA resolve, use handoff".
+// Por estar no código, ela valia mesmo contra as instruções publicadas: a
+// equipe não conseguia liberar o bot para responder "como está meu processo?"
+// (109 das 413 transferências de 09-22/09 eram de status). A regra de negócio
+// agora vive só nas instruções (CATEGORIAS DE ENCERRAMENTO), onde a equipe
+// edita. A v20 publicada já tem a MESMA proibição ("QUANDO NÃO USAR
+// action=resolve"), e o fallback STATIC_SYSTEM_PROMPT também: nada muda até a
+// v21 ser publicada.
+// recentAttendant (dono pegajoso, D5): alguém da equipe falou com o cliente
+// nos últimos 7 dias. Só o fato; como agir fica nas instruções (ATENDENTE
+// HUMANO NA CONVERSA). CRM antigo não manda o campo: a linha não aparece.
+// ---------------------------------------------------------------------------
+function renderConversationFacts(facts) {
+    if (!facts) return "";
+    const lines = [];
+    if (Number(facts.docsReceived) > 0) {
+        // Desde 25/09/2026 o CRM conta só foto/PDF do atendimento atual (sem
+        // áudio nem figurinha, sem atendimentos já encerrados).
+        lines.push(`- O cliente JÁ ENVIOU ${Number(facts.docsReceived)} arquivo(s) (foto/PDF) neste atendimento.`);
+    }
+    if (facts.registeredClient) lines.push("- O número é de um CLIENTE CADASTRADO (tem processo no sistema).");
+    if (facts.recentAttendant) lines.push("- Um ATENDENTE da equipe conversou com este cliente nos últimos 7 dias.");
+    if (!lines.length) return "";
+    return `ESTE ATENDIMENTO (fatos — o que fazer com eles está nas instruções: CATEGORIAS DE ENCERRAMENTO e ATENDENTE HUMANO NA CONVERSA):
+${lines.join("\n")}
+`;
+}
+
+// ---------------------------------------------------------------------------
 // Bloco DINÂMICO do system prompt — tudo que muda por conversa/mensagem.
 // ---------------------------------------------------------------------------
 function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows, priorOutcome, signature, conversationFacts }) {
@@ -1169,15 +1310,7 @@ REGRAS ENQUANTO A ASSINATURA ESTIVER PENDENTE:
 - Se ele disser que JÁ ASSINOU, que não conseguiu, que não sabe mexer, que quer desistir, ou pedir pra falar com alguém: action="handoff" imediatamente (handoffReason explicando).
 - Assunto que não é o documento/assinatura: responda em UMA frase e ofereça o atendente (handoff se ele aceitar ou insistir).
 ` : ""}
-${conversationFacts && (conversationFacts.docsReceived > 0 || conversationFacts.registeredClient) ? `ESTE ATENDIMENTO (sinais que mudam o desfecho correto):
-${conversationFacts.docsReceived > 0 ? `- O cliente JÁ ENVIOU ${conversationFacts.docsReceived} arquivo(s) nesta conversa (foto/PDF/áudio).` : ""}
-${conversationFacts.registeredClient ? "- O número é de um CLIENTE CADASTRADO (tem processo no sistema)." : ""}
-Nestes casos NÃO use action="resolve" para fechar o assunto: o caso precisa de
-andamento humano. Agradeça em UMA frase e use action="handoff" com
-handoffReason dizendo o que chegou/o que ele pediu (ex.: "prontuário recebido —
-dar andamento"). "resolve" só vale para dúvida simples que você mesma respondeu
-por completo e que não deixa nada pendente para a equipe.
-` : ""}
+${renderConversationFacts(conversationFacts)}
 FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
 ${memory || "(vazia — conversa nova)"}
 
@@ -1335,32 +1468,60 @@ const TRANSCRIBE_RETRY_DELAY_MS = 1200;
 
 // Devolve { text, usage }: `text` null = nada transcrito; `usage` no formato
 // do CRM (metadata.usage) para o custo da transcrição entrar no Canto da IA.
-async function transcribeAudio(media) {
+// `signal` (do /reply ou do /transcribe): abortou, para na hora, sem nova
+// tentativa, com erro de prazo.
+async function transcribeAudio(media, { signal } = {}) {
     if (!media?.url || !media?.mimeType) return { text: null, usage: null };
     if (!genAI) throw new Error("transcrição indisponível: GOOGLE_API_KEY ausente");
 
     let lastErr = null;
     for (let attempt = 1; attempt <= TRANSCRIBE_MAX_ATTEMPTS; attempt++) {
+        if (signal?.aborted) throw abortedError(signal);
         try {
-            return await transcribeAudioOnce(media);
+            return await transcribeAudioOnce(media, { signal });
         } catch (err) {
+            if (signal?.aborted) throw abortedError(signal);
             lastErr = err;
             if (attempt < TRANSCRIBE_MAX_ATTEMPTS) {
                 console.warn(`[BOT] transcrição falhou (tentativa ${attempt}/${TRANSCRIBE_MAX_ATTEMPTS}): ${err.message} — tentando de novo.`);
-                await new Promise((r) => setTimeout(r, TRANSCRIBE_RETRY_DELAY_MS * attempt));
+                await sleepOrAbort(TRANSCRIBE_RETRY_DELAY_MS * attempt, signal);
             }
         }
     }
     throw lastErr;
 }
 
-async function transcribeAudioOnce(media) {
-    const res = await fetch(media.url, { signal: AbortSignal.timeout(15000) });
-    if (!res.ok) throw new Error(`download da mídia falhou: HTTP ${res.status}`);
-    const buf = Buffer.from(await res.arrayBuffer());
+// Orçamento de "pensamento" do Gemini na transcrição. Sem a env, o padrão do
+// modelo (como sempre foi). TRANSCRIBE_THINKING_BUDGET=0 desliga o thinking:
+// ganha latência, mas pode piorar áudio ruidoso — ligar só depois de A/B de
+// qualidade no staging.
+const TRANSCRIBE_THINKING_BUDGET = (() => {
+    const raw = process.env.TRANSCRIBE_THINKING_BUDGET;
+    const n = raw === undefined || raw === "" ? NaN : Number(raw);
+    return Number.isFinite(n) && n >= 0 ? Math.round(n) : null;
+})();
+
+async function transcribeAudioOnce(media, { signal } = {}) {
+    // Download com teto de 15 s, que também cai se o /reply abortar.
+    const dl = linkedSignal(signal, 15000);
+    let buf;
+    try {
+        const res = await fetch(media.url, { signal: dl.signal });
+        if (!res.ok) throw new Error(`download da mídia falhou: HTTP ${res.status}`);
+        buf = Buffer.from(await res.arrayBuffer());
+    } finally {
+        dl.cleanup();
+    }
     if (buf.length > MAX_AUDIO_BYTES) throw new Error("mídia grande demais para a IA");
 
     const model = process.env.TRANSCRIBE_MODEL || "gemini-2.5-flash";
+    const config = {};
+    // abortSignal do Gemini é só do lado do cliente: a chamada já feita ainda
+    // é cobrada, mas as tentativas seguintes não saem.
+    if (signal) config.abortSignal = signal;
+    if (TRANSCRIBE_THINKING_BUDGET !== null) {
+        config.thinkingConfig = { thinkingBudget: TRANSCRIBE_THINKING_BUDGET };
+    }
     const response = await genAI.models.generateContent({
         model,
         contents: [{
@@ -1372,6 +1533,7 @@ async function transcribeAudioOnce(media) {
                 { inlineData: { mimeType: media.mimeType.split(";")[0].trim(), data: buf.toString("base64") } },
             ],
         }],
+        ...(Object.keys(config).length ? { config } : {}),
     });
 
     const text = typeof response.text === "string"
@@ -1541,8 +1703,14 @@ async function decide({
     priorOutcome = null,
     conversationFacts = null,
     signature = null,
+    // Prazo (epoch ms) e sinal de aborto do /reply (index.js). Tudo o que é
+    // chamada paga aqui dentro (compactação, transcrição, decisão) respeita os
+    // dois; sem eles (chamada direta), vale o timeout global.
+    deadline = null,
+    signal = null,
 }) {
     const model = process.env.MODEL || "claude-sonnet-5";
+    const budget = { deadline: deadline || undefined, signal: signal || undefined };
 
     // ---- Auto-reset de ticket encerrado -------------------------------------
     // Se a etapa que chega é "encerrando", o atendimento ANTERIOR já terminou
@@ -1586,7 +1754,7 @@ async function decide({
     // Ficha estourou o limite? Compacta ANTES de montar o prompt (o resultado
     // volta em `memory` e o app Next persiste — compacta 1x por estouro).
     if (effMemory && effMemory.length > MEMORY_SOFT_CHARS) {
-        effMemory = await compactMemory(effMemory);
+        effMemory = await compactMemory(effMemory, budget);
     }
 
     // Mídia do cliente (16/08/2026: agora o LOTE INTEIRO, não só o último):
@@ -1616,22 +1784,32 @@ async function decide({
     const MAX_TOTAL_MEDIA_BYTES = 20 * 1024 * 1024;   // teto somado (request da API ~32MB já com base64)
     let mediaBytes = 0;
     let skippedForCaps = 0;
+    // WhatsApp manda "audio/ogg; codecs=opus" — parâmetro após ";" derruba a
+    // validação de mimeType das APIs.
+    const baseMimeOf = (item) => String(item?.mimeType || "").split(";")[0].trim();
 
-    for (const item of mediaItems) {
+    // Áudios do lote transcritos EM PARALELO (26/09/2026): antes era um por vez
+    // dentro do laço, e cada áudio somava ~3-7 s na resposta (p50 com áudio
+    // 30,7 s × 23,3 s só com texto). Todas as transcrições saem já aqui; o
+    // laço abaixo só espera cada uma na ordem original, então o texto sai na
+    // mesma ordem de antes. O catch por item mantém o "não pôde ser
+    // transcrito" de um áudio sem derrubar os outros (nem virar rejeição solta).
+    const audioJobs = new Map();
+    mediaItems.forEach((item, idx) => {
+        if (!item?.url || !baseMimeOf(item).startsWith("audio/")) return;
+        audioJobs.set(idx, transcribeAudio(item, budget).catch((err) => {
+            console.error("[BOT] Falha ao transcrever áudio (após retries):", err.message);
+            return null;
+        }));
+    });
+
+    for (const [idx, item] of mediaItems.entries()) {
         if (!item?.url) continue;
-        const mt = String(item.mimeType || "");
-        // WhatsApp manda "audio/ogg; codecs=opus" — parâmetro após ";" derruba
-        // a validação de mimeType das APIs.
-        const baseMime = mt.split(";")[0].trim();
+        const baseMime = baseMimeOf(item);
         if (baseMime.startsWith("audio/")) {
-            let transcript = null;
-            try {
-                const out = await transcribeAudio(item);
-                transcript = out.text;
-                if (out.usage) transcribeUsage.push(out.usage);
-            } catch (err) {
-                console.error("[BOT] Falha ao transcrever áudio (após retries):", err.message);
-            }
+            const out = await audioJobs.get(idx);
+            const transcript = out?.text ?? null;
+            if (out?.usage) transcribeUsage.push(out.usage);
             if (transcript) {
                 clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
                 if (item.id) transcripts.push({ id: String(item.id), transcript });
@@ -1646,8 +1824,10 @@ async function decide({
             const isPdf = baseMime === "application/pdf";
             const MAX_BYTES = isPdf ? 30 * 1024 * 1024 : 4.5 * 1024 * 1024;
             if (mediaBlocks.length >= MAX_MEDIA_BLOCKS) { skippedForCaps++; continue; }
+            // Teto de 15 s por arquivo, que também cai se o /reply abortar.
+            const dl = linkedSignal(signal, 15000);
             try {
-                const resp = await fetch(item.url, { signal: AbortSignal.timeout(15000) });
+                const resp = await fetch(item.url, { signal: dl.signal });
                 if (!resp.ok) throw new Error(`download da mídia: HTTP ${resp.status}`);
                 const buf = Buffer.from(await resp.arrayBuffer());
                 if (buf.length > MAX_BYTES) {
@@ -1662,17 +1842,24 @@ async function decide({
             } catch (err) {
                 console.error("[BOT] Falha ao baixar imagem/PDF:", err.message);
                 mediaNotes.push("[um arquivo do cliente não pôde ser aberto por falha técnica — confirme o recebimento e, se o conteúdo for necessário, peça para reenviar]");
+            } finally {
+                dl.cleanup();
             }
         } else {
             mediaNotes.push(`[o cliente enviou um arquivo (${baseMime || "tipo desconhecido"}) que você NÃO consegue abrir — NÃO conte este arquivo como documento recebido; se o conteúdo importar, peça uma foto ou PDF]`);
         }
     }
 
+    // Prazo estourado (ou o CRM desistiu) durante a mídia: as falhas acima são
+    // o aborto, não áudio inaudível. Sem isto o micro responderia o texto fixo
+    // "não consegui ouvir" no lugar do 504.
+    if (signal?.aborted) throw abortedError(signal);
+
     // Só áudio no lote, nada transcrito e nenhum texto → não há NADA para a IA
     // reagir. Pede para repetir (texto fixo de segurança). understood=false de
     // propósito: alinhado à regra R4 do playbook — cliente que insiste em
     // áudio inaudível cai pro atendente humano no 2º strike.
-    const hadAudio = mediaItems.some((i) => String(i?.mimeType || "").split(";")[0].trim().startsWith("audio/"));
+    const hadAudio = mediaItems.some((i) => baseMimeOf(i).startsWith("audio/"));
     if (hadAudio && !transcripts.length && !message && !mediaBlocks.length) {
         return {
             reply: "Não consegui ouvir direito seu áudio 😅 Pode repetir ou mandar por escrito?",
@@ -1750,7 +1937,7 @@ async function decide({
         return textos.some((t) => typeof t === "string" && looksLikeReasoning(t))
             ? "raciocínio da IA vazou no texto do cliente"
             : null;
-    });
+    }, budget);
 
     // Uso de tokens da chamada ao Claude — o app Next grava no log wa_bot e
     // calcula o gasto (semanal/mensal) no dashboard "Desempenho do Chatbot".
@@ -2608,4 +2795,6 @@ module.exports = {
     // está usando (remoto do CRM ou o embutido de fallback) sem gastar uma
     // chamada ao modelo.
     getStaticPrompt,
+    // Motivo do aborto do /reply (prazo): o index.js cria, o callClaude reconhece.
+    deadlineError,
 };

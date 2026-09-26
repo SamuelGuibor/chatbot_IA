@@ -45,6 +45,7 @@ npm start        # porta 3003
 | `GOOGLE_API_KEY` | mesma chave Gemini do app Next |
 | `BOT_SECRET` | segredo compartilhado com o app Next (`CHATBOT_SECRET` lá) |
 | `GEMINI_MODEL` | opcional, default `gemini-2.5-flash` |
+| `TRANSCRIBE_THINKING_BUDGET` | opcional; sem ela o Gemini da transcrição pensa no padrão do modelo. `0` desliga o thinking (mais rápido): só depois de A/B de qualidade no staging |
 | `PORT` | fornecido pelo Railway (local: 3003) |
 
 ## Contrato
@@ -68,6 +69,13 @@ npm start        # porta 3003
 
 `message` pode ser `""` quando a mensagem é só áudio (`media`). `lookupResult`
 só vai na segunda chamada, quando a primeira devolveu `action: "lookup"`.
+
+Header opcional `x-bot-budget-ms`: quanto o `/reply` pode gastar (o CRM manda
+o timeout da tentativa menos 3 s; sem o header, 40 s; limitado a 5–60 s).
+Estourou o prazo, ou o CRM desconectou, o trabalho em andamento é abortado
+(nenhuma chamada nova ao Claude/Gemini sai) e a resposta é
+`504 { "error": "deadline", "detail": "prazo do CRM esgotado" }`, que o CRM
+conta como timeout. Os áudios do lote são transcritos em paralelo.
 
 Resposta:
 

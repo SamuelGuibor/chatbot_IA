@@ -1,19 +1,56 @@
 require("dotenv").config();
 const express = require("express");
-const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook , extractContractData, confirmContractReply } = require("./bot");
+const { decide, farewell, followupDecision, recoveryMessage, suggest, summarize, transcribeAudio, distillLesson, consolidatePlaybook , extractContractData, confirmContractReply, deadlineError } = require("./bot");
 
 const SECRET = process.env.BOT_SECRET || "";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
+
+// Orçamento do /reply (26/09/2026): o CRM espera 45 s por tentativa e manda
+// no header x-bot-budget-ms quanto o micro pode gastar (relativo: não depende
+// do relógio dos dois lados). Sem o header (CRM antigo), 40 s. Estourou →
+// 504 "prazo do CRM esgotado", que o CRM conta como timeout (mesma política
+// de retry de antes). Antes o micro seguia pagando Claude/Gemini depois de o
+// CRM já ter desistido.
+const DEFAULT_REPLY_BUDGET_MS = 40_000;
+const MIN_REPLY_BUDGET_MS = 5_000;
+const MAX_REPLY_BUDGET_MS = 60_000;
+
+function replyBudgetMs(header) {
+  const n = Number(header);
+  if (!Number.isFinite(n) || n <= 0) return DEFAULT_REPLY_BUDGET_MS;
+  return Math.min(Math.max(Math.round(n), MIN_REPLY_BUDGET_MS), MAX_REPLY_BUDGET_MS);
+}
+
+/**
+ * Aborta `controller` se o CRM desconectar antes de a resposta sair.
+ * res.on("close"), NUNCA req.on("close"): no Node ≥ 16 o "close" do req
+ * dispara quando o corpo termina de ser lido (logo depois do express.json) e
+ * abortaria toda chamada. writableFinished = a resposta já saiu inteira (o
+ * "close" normal). Atrás do proxy do Railway o aviso de desconexão pode não
+ * chegar: a proteção principal é o prazo; isto é bônus.
+ */
+function abortOnClientGone(res, controller, what) {
+  res.on("close", () => {
+    if (!res.writableFinished && !controller.signal.aborted) {
+      controller.abort(deadlineError(`o CRM desconectou antes ${what}`));
+    }
+  });
+}
 
 app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "chatbot-whatsapp", model: process.env.MODEL || "claude-sonnet-5" });
 });
 
 // Body: { contact, processInfo, history, message, media?, memory?, state?,
-//         failCount?, business?, lookupResult? }             (ver bot.js)
+//         failCount?, business?, lookupResult?, conversationFacts? }  (ver bot.js)
+// conversationFacts = { docsReceived, registeredClient, recentAttendant? }:
+// vai inteiro para o bloco "ESTE ATENDIMENTO" (renderConversationFacts), então
+// fato novo lá dentro não precisa entrar no destructuring abaixo.
 // Resposta: { reply, action, handoffReason?, lookup?, memory, state, intent,
 //             emotion, understood, confidence }
+// Header opcional x-bot-budget-ms: orçamento em ms (ver replyBudgetMs);
+// estourou ou o CRM desconectou → 504 { error: "deadline" }.
 app.post("/reply", async (req, res) => {
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
@@ -26,6 +63,12 @@ app.post("/reply", async (req, res) => {
   if ((!message || typeof message !== "string") && !media?.url && !hasMediaList) {
     return res.status(400).json({ error: "message, media ou mediaList obrigatórios" });
   }
+
+  const startedAt = Date.now();
+  const budgetMs = replyBudgetMs(req.headers["x-bot-budget-ms"]);
+  const ac = new AbortController();
+  const deadlineTimer = setTimeout(() => ac.abort(deadlineError()), budgetMs);
+  abortOnClientGone(res, ac, "da resposta");
 
   try {
     const decision = await decide({
@@ -44,6 +87,8 @@ app.post("/reply", async (req, res) => {
       priorOutcome: priorOutcome ?? null,
       signature: signature ?? null,
       conversationFacts: conversationFacts ?? null,
+      deadline: startedAt + budgetMs,
+      signal: ac.signal,
     });
     console.log(
       `[BOT] ${contact?.phone ?? "?"} → action=${decision.action} intent=${decision.intent}` +
@@ -63,6 +108,18 @@ app.post("/reply", async (req, res) => {
     });
     res.json(decision);
   } catch (err) {
+    // Prazo estourado ou CRM desconectado: nenhuma chamada nova sai (o sinal
+    // já abortou tudo) e o CRM recebe 504, que ele trata como timeout.
+    if (err?.isDeadline || ac.signal.aborted) {
+      console.warn(
+        `[BOT] ${contact?.phone ?? "?"} → /reply abortado após ${Date.now() - startedAt} ms ` +
+        `(orçamento ${budgetMs} ms): ${String(err?.message ?? err)}`,
+      );
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(504).json({ error: "deadline", detail: "prazo do CRM esgotado" });
+      }
+      return;
+    }
     console.error("[BOT] Erro na IA:", err);
     // Falha da IA → o app Next joga na fila humana SEM mandar mensagem de
     // erro pro cliente. Um erro aqui nunca deixa o cliente falando sozinho.
@@ -75,6 +132,8 @@ app.post("/reply", async (req, res) => {
       claudeStatus: err?.status ?? null,
       claudeErrorType: err?.claudeErrorType ?? null,
     });
+  } finally {
+    clearTimeout(deadlineTimer);
   }
 });
 
@@ -192,13 +251,22 @@ app.post("/transcribe", async (req, res) => {
   if (!url || !mimeType) {
     return res.status(400).json({ error: "url e mimeType obrigatórios" });
   }
+  // O CRM também chama aqui na chegada do áudio (transcrição antecipada do
+  // bot) e desiste depois de alguns segundos: sem o aborto, as tentativas
+  // seguintes do Gemini sairiam para ninguém.
+  const ac = new AbortController();
+  abortOnClientGone(res, ac, "da transcrição");
   try {
-    const out = await transcribeAudio({ url, mimeType });
+    const out = await transcribeAudio({ url, mimeType }, { signal: ac.signal });
     const transcript = out.text;
     if (!transcript) throw new Error("transcrição vazia");
     console.log(`[BOT] transcribe ok (${transcript.length} chars).`);
     res.json({ transcript, usage: out.usage });
   } catch (err) {
+    if (ac.signal.aborted) {
+      console.warn(`[BOT] transcribe abortado: ${String(err?.message ?? err)}`);
+      return;
+    }
     console.error("[BOT] Erro na transcrição:", err);
     res.status(500).json({ error: "transcribe_error", detail: String(err?.message ?? err) });
   }
