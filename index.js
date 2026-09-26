@@ -182,7 +182,8 @@ app.post("/summarize", async (req, res) => {
 });
 
 // Transcrição de áudio avulsa (botão "transcrever" do atendimento humano).
-// Body: { url, mimeType } → { transcript }  (url = pré-assinada do S3)
+// Body: { url, mimeType } → { transcript, usage }  (url = pré-assinada do S3;
+// usage = tokens do Gemini para o CRM gravar no log wa_transcribe)
 app.post("/transcribe", async (req, res) => {
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
@@ -192,10 +193,11 @@ app.post("/transcribe", async (req, res) => {
     return res.status(400).json({ error: "url e mimeType obrigatórios" });
   }
   try {
-    const transcript = await transcribeAudio({ url, mimeType });
+    const out = await transcribeAudio({ url, mimeType });
+    const transcript = out.text;
     if (!transcript) throw new Error("transcrição vazia");
     console.log(`[BOT] transcribe ok (${transcript.length} chars).`);
-    res.json({ transcript });
+    res.json({ transcript, usage: out.usage });
   } catch (err) {
     console.error("[BOT] Erro na transcrição:", err);
     res.status(500).json({ error: "transcribe_error", detail: String(err?.message ?? err) });

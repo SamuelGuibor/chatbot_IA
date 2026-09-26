@@ -107,11 +107,27 @@ function thinkingFor(model, budgetTokens = 2048) {
         : { type: "adaptive" };
 }
 
+// Soma o `usage` cru da Anthropic de várias chamadas (campos em snake_case).
+const RAW_USAGE_KEYS = ["input_tokens", "output_tokens", "cache_read_input_tokens", "cache_creation_input_tokens"];
+function addRawUsage(acc, usage) {
+    if (!usage) return acc;
+    if (!acc) return { ...usage };
+    const out = { ...acc };
+    for (const k of RAW_USAGE_KEYS) out[k] = (Number(acc[k]) || 0) + (Number(usage[k]) || 0);
+    return out;
+}
+
+// O retry abaixo (JSON inválido ou raciocínio vazado) é uma SEGUNDA chamada
+// paga: o usage devolvido é a soma de todas as tentativas, não só a final
+// (26/09/2026 — antes o gasto da 1ª tentativa sumia da conta do CRM).
 async function callClaudeStructured(params, context, validate = null) {
     let lastRaw = "";
     let lastOk = null;
+    let totalUsage = null;
+    const withTotal = (response) => (totalUsage ? { ...response, usage: totalUsage } : response);
     for (let attempt = 1; attempt <= 2; attempt++) {
         const response = await callClaude(params);
+        totalUsage = addRawUsage(totalUsage, response.usage);
         if (response.stop_reason === "refusal") {
             throw new Error(`modelo recusou (refusal) [${context}]`);
         }
@@ -136,9 +152,9 @@ async function callClaudeStructured(params, context, validate = null) {
         if (problem) {
             console.error(`[BOT] ${context}: ${problem} — persistiu após retry. Bruto:`, clipText(raw, 800));
         }
-        return { data, response };
+        return { data, response: withTotal(response) };
     }
-    if (lastOk) return lastOk;
+    if (lastOk) return { data: lastOk.data, response: withTotal(lastOk.response) };
     console.error(`[BOT] ${context}: JSON inválido após retry. Resposta bruta:`, clipText(lastRaw, 800));
     throw new Error(`${context}: saída não é JSON válido`);
 }
@@ -1317,8 +1333,10 @@ async function buildSystemBlocks(params) {
 const TRANSCRIBE_MAX_ATTEMPTS = 3;
 const TRANSCRIBE_RETRY_DELAY_MS = 1200;
 
+// Devolve { text, usage }: `text` null = nada transcrito; `usage` no formato
+// do CRM (metadata.usage) para o custo da transcrição entrar no Canto da IA.
 async function transcribeAudio(media) {
-    if (!media?.url || !media?.mimeType) return null;
+    if (!media?.url || !media?.mimeType) return { text: null, usage: null };
     if (!genAI) throw new Error("transcrição indisponível: GOOGLE_API_KEY ausente");
 
     let lastErr = null;
@@ -1342,8 +1360,9 @@ async function transcribeAudioOnce(media) {
     const buf = Buffer.from(await res.arrayBuffer());
     if (buf.length > MAX_AUDIO_BYTES) throw new Error("mídia grande demais para a IA");
 
+    const model = process.env.TRANSCRIBE_MODEL || "gemini-2.5-flash";
     const response = await genAI.models.generateContent({
-        model: process.env.TRANSCRIBE_MODEL || "gemini-2.5-flash",
+        model,
         contents: [{
             role: "user",
             parts: [
@@ -1358,7 +1377,28 @@ async function transcribeAudioOnce(media) {
     const text = typeof response.text === "string"
         ? response.text
         : response.candidates?.[0]?.content?.parts?.[0]?.text;
-    return (text ?? "").trim() || null;
+    return { text: (text ?? "").trim() || null, usage: geminiAudioUsage(response, model) };
+}
+
+/**
+ * Tokens de uma chamada de transcrição do Gemini no formato de
+ * metadata.usage do CRM. O modelo vai com o sufixo "-audio": o Gemini cobra a
+ * entrada de áudio mais caro que texto, e o MODEL_PRICING do CRM tem chave
+ * própria para isso. promptTokenCount JÁ inclui o que veio do cache
+ * (cachedContentTokenCount), por isso a subtração; o "pensamento"
+ * (thoughtsTokenCount) é cobrado como saída.
+ */
+function geminiAudioUsage(response, model) {
+    const u = response?.usageMetadata;
+    if (!u) return null;
+    const cached = Number(u.cachedContentTokenCount) || 0;
+    return {
+        model: `${model}-audio`,
+        inputTokens: Math.max(0, (Number(u.promptTokenCount) || 0) - cached),
+        outputTokens: (Number(u.candidatesTokenCount) || 0) + (Number(u.thoughtsTokenCount) || 0),
+        cacheReadTokens: cached,
+        cacheWriteTokens: 0,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1568,6 +1608,9 @@ async function decide({
     // CRM persistir em WhatsAppMessage.transcript — sem isso, nos turnos
     // seguintes o histórico só mostrava "[anexo: áudio]" e o conteúdo sumia.
     const transcripts = [];
+    // Tokens de cada transcrição (Gemini): o CRM grava num log próprio, sem
+    // misturar com o usage do Claude (outro modelo, outro preço).
+    const transcribeUsage = [];
     const mediaNotes = [];
     const MAX_MEDIA_BLOCKS = 8;                       // teto de arquivos abertos por chamada
     const MAX_TOTAL_MEDIA_BYTES = 20 * 1024 * 1024;   // teto somado (request da API ~32MB já com base64)
@@ -1583,7 +1626,9 @@ async function decide({
         if (baseMime.startsWith("audio/")) {
             let transcript = null;
             try {
-                transcript = await transcribeAudio(item);
+                const out = await transcribeAudio(item);
+                transcript = out.text;
+                if (out.usage) transcribeUsage.push(out.usage);
             } catch (err) {
                 console.error("[BOT] Falha ao transcrever áudio (após retries):", err.message);
             }
@@ -1642,6 +1687,7 @@ async function decide({
             understood: false,
             confidence: 0.3,
             transcripts: [],
+            transcribeUsage,
         };
     }
 
@@ -1794,6 +1840,9 @@ async function decide({
         // em WhatsAppMessage.transcript para o conteúdo sobreviver no histórico
         // dos próximos turnos (e o botão "transcrever" não pagar IA de novo).
         transcripts,
+        // Custo das transcrições deste turno (CRM novo grava wa_transcribe;
+        // o antigo ignora o campo).
+        transcribeUsage,
     };
 }
 
@@ -2291,7 +2340,7 @@ async function confirmContractReply({ contact, extracted, message = "", media = 
     let clientText = message;
     if (media?.url && String(media.mimeType || "").startsWith("audio/")) {
         try {
-            const transcript = await transcribeAudio(media);
+            const { text: transcript } = await transcribeAudio(media);
             if (transcript) clientText = clientText ? `${clientText}\n[áudio transcrito] ${transcript}` : transcript;
         } catch (err) {
             console.warn("[BOT] confirmação: transcrição falhou:", err.message);
