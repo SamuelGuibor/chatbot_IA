@@ -95,7 +95,61 @@ Resposta:
 }
 ```
 
+### Pedido do atendente em aberto (30/09/2026)
+
+Campos novos, todos opcionais e DENTRO de objetos que o `index.js` já repassa
+inteiros (campo novo de topo precisa entrar no destructuring do `index.js`):
+
+- `conversationFacts.attendantRequest`: `{ text (≤1500), source: "devolver" | "lista_atendente" | "fluxo_ia", at (ISO), returnedToBot, docsSinceOpened, nudges, flowName? }`
+- `conversationFacts.docsThisTurn` (foto/PDF desde a última saída, sem teto), `burstTruncated`, `cardColumn` (nome da coluna do card), `contractPending: { link, sentAt }` (último link da ZapSign mandado por atendente)
+- `priorOutcome.returnedByAttendant`, `priorOutcome.returnedAt`
+- `mediaList[].fileName` (`midia.*` = sem nome)
+
+Resposta do `/reply` ganha `handoffAfterFlow` (boolean; só vale com
+`action: "send_flow"` + `flowName` + `handoffReason`: o CRM manda o fluxo e
+depois transfere, sem texto de transferência — caso "assinei"), `keepRequest`
+(boolean; só vale com `action: "handoff"`: o CRM transfere MANTENDO o pedido
+em aberto — "assinei" com a LISTA já mandada, cliente ocupado/pede ligação),
+`rationale` (≤600 caracteres, NUNCA vai ao cliente), `model` e
+`brain: { source: "crm" | "fallback", instructionsVersion, playbookVersion, stale }`.
+
+`/followup-decision` aceita o header `x-bot-budget-ms` (como o `/reply`; a
+cobrança do pedido em aberto do CRM manda ~32 s): estourou ou o CRM
+desconectou → 504 `{ error: "deadline" }`. A cobrança roda com raciocínio no
+esforço `low` e `max_tokens` 1500 (`pendingCallConfig`).
+
+**As instruções publicadas citam estas strings do bloco dinâmico ao pé da
+letra** (`renderConversationFacts`, `renderAttendantRequest`,
+`renderReturnedByTeam` em `bot.js`; os testes em `test/` travam o texto):
+
+- `ESTE ATENDIMENTO (fatos do sistema):`
+- `- Arquivos (foto/PDF) que chegaram NESTE turno: N — K aberto(s) e anexado(s) a esta mensagem, M NÃO aberto(s).`
+- `- Arquivos (foto/PDF) recebidos ANTES deste turno, neste atendimento: N.`
+- `- Parte deste lote não coube nesta chamada (mensagens/arquivos a mais).`
+- `- O número está vinculado a um cadastro no sistema (cliente com processo).`
+- `- Coluna do card no kanban: X.`
+- `- Contrato enviado pelo atendente em DD/MM às HH:MM, ainda sem confirmação de assinatura no kanban. Link enviado: <link>`
+- `- Houve mensagem de um atendente da equipe para este cliente nos últimos 7 dias.`
+- `PEDIDO DO ATENDENTE EM ABERTO (fatos do sistema):` com `- Quem pediu:`, `- Origem:`, `- Devolvido ao bot depois do pedido:`, `- Arquivos recebidos desde o pedido:`, `- Cobranças automáticas já enviadas:`, `- Texto do pedido:` (linhas citadas com `  | `)
+- `CONVERSA DEVOLVIDA PELA EQUIPE (fatos do sistema):`
+- ETAPA `nenhuma em andamento (última registrada: X; depois dela a conversa esteve com a equipe)`; FICHA `(vazia)`; `Tentativas seguidas sem entender até agora: N.`
+- nota por turno `[FATO DO SISTEMA: a última mensagem enviada ao cliente antes desta foi de um [atendente] da equipe, não sua.]`
+- rótulo de anexo `[anexo k de N: PDF "nome"]`
+
+`POST /followup-decision` aceita `pendingRequest: { text, source, at,
+flowName?, docsSinceOpened, attempt, windowClosesAt, lastClientAt,
+previousMissing? }` (cobrança do pedido em aberto) e devolve
+`{ mode: "pending", action: "nudge" | "silent" | "handoff", message, missing, reason, leaked, usage }`.
+Sem `pendingRequest`, o modo antigo devolve
+`{ mode: "followup", action: "nudge" | "close", message, reason, usage }`.
+
 `GET /health` → `{ ok: true }`.
+
+## Testes
+
+```bash
+npm test   # node --test: funções puras + decide()/followupDecision() com o Claude trocado por dublê
+```
 
 ## Deploy no Railway
 

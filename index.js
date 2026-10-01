@@ -6,7 +6,8 @@ const SECRET = process.env.BOT_SECRET || "";
 const app = express();
 app.use(express.json({ limit: "10mb" }));
 
-// Orçamento do /reply (26/09/2026): o CRM espera 45 s por tentativa e manda
+// Orçamento do /reply (26/09/2026; também do /followup-decision desde 30/09):
+// o CRM espera 45 s por tentativa e manda
 // no header x-bot-budget-ms quanto o micro pode gastar (relativo: não depende
 // do relógio dos dois lados). Sem o header (CRM antigo), 40 s. Estourou →
 // 504 "prazo do CRM esgotado", que o CRM conta como timeout (mesma política
@@ -42,13 +43,23 @@ app.get("/health", (_req, res) => {
   res.json({ ok: true, service: "chatbot-whatsapp", model: process.env.MODEL || "claude-sonnet-5" });
 });
 
-// Body: { contact, processInfo, history, message, media?, memory?, state?,
-//         failCount?, business?, lookupResult?, conversationFacts? }  (ver bot.js)
-// conversationFacts = { docsReceived, registeredClient, recentAttendant? }:
-// vai inteiro para o bloco "ESTE ATENDIMENTO" (renderConversationFacts), então
-// fato novo lá dentro não precisa entrar no destructuring abaixo.
-// Resposta: { reply, action, handoffReason?, lookup?, memory, state, intent,
-//             emotion, understood, confidence }
+// Body: { contact, processInfo, history, message, media?, mediaList?, memory?,
+//         state?, failCount?, business?, lookupResult?, flows?, priorOutcome?,
+//         signature?, conversationFacts? }  (ver bot.js)
+// conversationFacts = { docsReceived, registeredClient, recentAttendant?,
+//   docsThisTurn?, burstTruncated?, cardColumn?, contractPending? {link, sentAt},
+//   attendantRequest? {text, source, at, returnedToBot, docsSinceOpened,
+//   nudges, flowName?} }; priorOutcome += returnedByAttendant?, returnedAt?;
+// mediaList[] += fileName?. Tudo DENTRO de objetos que já passam inteiros,
+// então fato novo lá dentro não precisa entrar no destructuring abaixo. Campo
+// novo de TOPO precisa (armadilha do priorOutcome).
+// Resposta: { reply, replies, action, flowName, handoffAfterFlow, keepRequest,
+//             handoffReason?, closeCategory, lookup?, memory, state, intent,
+//             emotion, understood, confidence, optOut, appliedRules, silent,
+//             leaked, usage, transcripts, transcribeUsage,
+//             rationale (≤600, NUNCA vai ao cliente), model,
+//             brain { source: "crm"|"fallback", instructionsVersion,
+//                     playbookVersion, stale } }
 // Header opcional x-bot-budget-ms: orçamento em ms (ver replyBudgetMs);
 // estourou ou o CRM desconectou → 504 { error: "deadline" }.
 app.post("/reply", async (req, res) => {
@@ -99,12 +110,15 @@ app.post("/reply", async (req, res) => {
     // NÃO logar `decision` inteira: `memory` é a ficha do cliente (pode conter
     // CPF/endereço) — o próprio prompt proíbe expor esses dados; log não é
     // exceção. Loga o resto + só o TAMANHO da ficha.
-    const { memory: _memory, reply: _reply, replies: _replies, ...meta } = decision;
+    // rationale também fica de fora: pode citar dado do cliente, e o bot.js
+    // já loga o raciocínio cortado.
+    const { memory: _memory, reply: _reply, replies: _replies, rationale: _rationale, ...meta } = decision;
     console.log("[BOT COMPLETO]:", {
       ...meta,
       reply: String(_reply ?? "").slice(0, 120),
       repliesCount: Array.isArray(_replies) ? _replies.length : 0,
       memoryChars: String(_memory ?? "").length,
+      rationaleChars: String(_rationale ?? "").length,
     });
     res.json(decision);
   } catch (err) {
@@ -175,23 +189,58 @@ app.post("/recovery-message", async (req, res) => {
   }
 });
 
-// Decisão de follow-up do cron (app Next): quando o cliente sumiu 30min+ e a
-// última mensagem foi do bot, a IA decide se ainda cabe cutucar ou se a conversa
-// já teve fecho natural (encerrar em silêncio).
-// Body: { contact, history, memory, state } → { action: "nudge"|"close", message, reason }
+// Decisão de follow-up do cron (app Next). Dois modos:
+//  - sem pendingRequest: o cliente sumiu 30min+ e a última mensagem foi do
+//    bot; a IA decide se ainda cabe cutucar ou se a conversa já teve fecho
+//    natural → { mode: "followup", action: "nudge"|"close", message, reason, usage }
+//  - com pendingRequest (30/09/2026, pedido do atendente em aberto): cobrança
+//    da lista → { mode: "pending", action: "nudge"|"silent"|"handoff",
+//    message (só com nudge), missing ("; "), reason, leaked, usage }
+// Body: { contact, history, memory, state, pendingRequest? } com
+// pendingRequest = { text, source, at, flowName?, docsSinceOpened, attempt,
+// windowClosesAt, lastClientAt, previousMissing? }. Tudo da cobrança vai
+// DENTRO de pendingRequest: campo de topo fora deste destructuring se perde.
+// Header opcional x-bot-budget-ms (o mesmo do /reply; a cobrança do CRM manda
+// ~32 s): estourou ou o CRM desconectou → 504 { error: "deadline" } e a IA
+// para de ser paga. Antes o micro terminava (e cobrava) a chamada que o CRM
+// já tinha abandonado aos 12 s. Sem o header (follow-up de silêncio), 40 s.
 app.post("/followup-decision", async (req, res) => {
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
   }
-  const { contact, history, memory, state } = req.body || {};
+  const { contact, history, memory, state, pendingRequest } = req.body || {};
+  const startedAt = Date.now();
+  const budgetMs = replyBudgetMs(req.headers["x-bot-budget-ms"]);
+  const ac = new AbortController();
+  const deadlineTimer = setTimeout(() => ac.abort(deadlineError()), budgetMs);
+  abortOnClientGone(res, ac, "da decisão de follow-up");
   try {
-    const decision = await followupDecision({ contact, history, memory, state });
-    console.log(`[BOT] follow-up ${contact?.name ?? "?"}: ${decision.action}${decision.reason ? ` (${decision.reason})` : ""}`);
+    const decision = await followupDecision(
+      { contact, history, memory, state, pendingRequest: pendingRequest ?? null },
+      { deadline: startedAt + budgetMs, signal: ac.signal },
+    );
+    console.log(
+      `[BOT] ${decision.mode === "pending" ? "cobrança" : "follow-up"} ${contact?.name ?? "?"}: ${decision.action}` +
+      (decision.reason ? ` (${decision.reason})` : "") +
+      (decision.mode === "pending" && decision.missing ? ` — falta: ${decision.missing.slice(0, 120)}` : ""),
+    );
     res.json(decision);
   } catch (err) {
+    if (err?.isDeadline || ac.signal.aborted) {
+      console.warn(
+        `[BOT] follow-up ${contact?.name ?? "?"} abortado após ${Date.now() - startedAt} ms ` +
+        `(orçamento ${budgetMs} ms): ${String(err?.message ?? err)}`,
+      );
+      if (!res.headersSent && !res.writableEnded) {
+        res.status(504).json({ error: "deadline", detail: "prazo do CRM esgotado" });
+      }
+      return;
+    }
     console.error("[BOT] Erro na decisão de follow-up:", err);
     // O app Next tem fallback (heurística local) — só sinalizamos o erro.
     res.status(500).json({ error: "followup_error", detail: String(err?.message ?? err) });
+  } finally {
+    clearTimeout(deadlineTimer);
   }
 });
 

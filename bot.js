@@ -411,7 +411,37 @@ const responseSchema = {
         },
         handoffReason: {
             type: "string",
-            description: "Motivo curto da transferência/qualificação. Vazio se não se aplica.",
+            description: "Motivo curto da transferência/qualificação (também quando handoffAfterFlow=true). Vazio se não se aplica.",
+        },
+        // 30/09/2026 (decisão 5 do dono, caso "assinei"): a IA manda um fluxo
+        // (a LISTA DE DOCUMENTOS do INSS) e, logo depois, a conversa vai para a
+        // equipe conferir a assinatura na ZapSign — sem texto de transferência
+        // para o cliente e sem encerrar o pedido da lista. O CRM executa o
+        // fluxo e depois o handoffToQueue com o handoffReason. Só vale com
+        // action=send_flow + flowName + handoffReason (sanitizeHandoffAfterFlow).
+        // Campo novo de schema = 3 lugares: instruções, aqui e BotDecision do
+        // bot.ts. CRM antigo ignora o campo (fica só o fluxo).
+        handoffAfterFlow: {
+            type: "boolean",
+            // Descrição neutra de propósito: quando usar é das instruções. Um
+            // exemplo aqui ("assinei") ativaria o comportamento com as
+            // instruções antigas no ar e com o CRM antigo, que ignora o campo
+            // e só mandaria o fluxo, sem ninguém conferir a assinatura.
+            description: "true SOMENTE com action=\"send_flow\" quando as instruções mandarem passar a conversa para a equipe logo depois do fluxo (o sistema envia o fluxo e em seguida transfere, usando o handoffReason). Exige handoffReason. NÃO escreva mensagem de transferência no reply. false em todos os outros casos.",
+        },
+        // 30/09/2026 (revisão do pedido em aberto): todo handoff do cérebro
+        // CONCLUI o pedido do atendente no CRM. Duas transferências das
+        // instruções acontecem no MEIO da lista ("assinei" com a LISTA já
+        // mandada; cliente ocupado ou que pede ligação) e o pedido tem de
+        // continuar valendo quando a equipe devolver a conversa. Só vale com
+        // action=handoff (sanitizeKeepRequest). Campo novo de schema = 3
+        // lugares: instruções, aqui e BotDecision do bot.ts. CRM antigo ignora
+        // (conclui, como antes).
+        keepRequest: {
+            type: "boolean",
+            // Neutra pelo mesmo motivo do handoffAfterFlow: quando usar é das
+            // instruções.
+            description: "true SOMENTE com action=\"handoff\" quando as instruções mandarem transferir MANTENDO o pedido do atendente em aberto (o pedido continua valendo quando a conversa voltar para você). false em todos os outros casos.",
         },
         lookup: {
             type: "string",
@@ -452,11 +482,31 @@ const responseSchema = {
     },
     required: [
         "rationale",
-        "reply", "replies", "action", "flowName", "closeCategory", "handoffReason",
+        "reply", "replies", "action", "flowName", "closeCategory", "handoffReason", "handoffAfterFlow", "keepRequest",
         "lookup", "memory", "state", "intent", "emotion", "understood", "confidence", "optOut",
         "appliedRules", "silent",
     ],
 };
+
+/**
+ * handoffAfterFlow só vale junto com action=send_flow, um flowName e um
+ * handoffReason (o motivo vai na nota da Fila). Fora disso é descartado:
+ * o código não inventa motivo de transferência no lugar do cérebro.
+ */
+function sanitizeHandoffAfterFlow({ action, flowName, handoffReason, handoffAfterFlow }) {
+    if (handoffAfterFlow !== true) return false;
+    return action === "send_flow"
+        && String(flowName ?? "").trim() !== ""
+        && String(handoffReason ?? "").trim() !== "";
+}
+
+/**
+ * keepRequest só vale com action=handoff (transferir mantendo o pedido em
+ * aberto). Fora disso é descartado: o pedido segue a regra de sempre.
+ */
+function sanitizeKeepRequest({ action, keepRequest }) {
+    return keepRequest === true && action === "handoff";
+}
 
 // ---------------------------------------------------------------------------
 // Validação CPF / email / data em código (a IA recebe como nota de sistema)
@@ -648,6 +698,7 @@ SE priorOutcome.qualified === true  → NUNCA rodar triagem. Classificar a mensa
   • progresso do caso ("mandei mensagem no hospital", "juntei os exames", "consegui o documento")
     → reply acolhedor: "Perfeito! Então já podemos dar entrada no seu contrato 😊..."
     → action: "handoff", closeCategory: "qualificado"   (humano continua o contrato)
+    (EXCETO com PEDIDO DO ATENDENTE EM ABERTO: aí siga aquela seção.)
   • dúvida pontual → responder → action: "continue" (ou "resolve" se encerrou)
   • acidente DIFERENTE/novo → aí sim iniciar triagem só do caso novo → action: "continue"
   • ambíguo → "Você quer tirar uma dúvida ou dar entrada em um novo caso?" → action: "continue"
@@ -671,6 +722,11 @@ SE o bloco ATENDIMENTO ANTERIOR existir (qualquer categoria, qualificado ou não
   tem os dados). Agradecimento/despedida/papo social após você já ter se despedido
   → UMA frase curta sem pergunta, ou encerre em silêncio (silent=true).
   Assunto NOVO de verdade → aí sim conduza a etapa adequada, aproveitando a ficha.
+
+SE o bloco CONVERSA DEVOLVIDA PELA EQUIPE existir, ou a ETAPA vier como
+"nenhuma em andamento": a conversa NÃO foi encerrada — a equipe conduziu e
+devolveu. Continue de onde o histórico parou (sem saudação, sem triagem) e
+reconstrua a FICHA pelo histórico se ela vier vazia.
 
 Na primeira pergunta da triagem, introduza:
 
@@ -880,6 +936,9 @@ NUNCA diga que um documento foi "aprovado" ou "está tudo certo juridicamente"
 — quem confere de verdade é o time humano.
 
 ENCERRAMENTO DA COLETA (escolha UMA das saídas):
+(Estas saídas são dos 4 itens DESTA seção. Com PEDIDO DO ATENDENTE EM ABERTO
+de outra lista — ex.: documentos do Meu INSS — vale a seção daquele pedido, e
+o fluxo "Solicitar Relato Acidente" não se aplica.)
 
 A) COLETA COMPLETA PELA IA (RG ou CNH legível + endereço + estado civil +
    profissão, tudo recebido): dispare o fluxo do relato do acidente:
@@ -1056,7 +1115,8 @@ equipe precisa dar andamento. Nesses casos: agradeça em UMA frase e use
 action="handoff" com handoffReason dizendo o que chegou ("prontuário recebido —
 dar andamento", "cliente cadastrado perguntou sobre a perícia"). "resolve" fica
 só para a dúvida simples que você respondeu por completo e que não deixa nada
-pendente para ninguém.
+pendente para ninguém. Isto só troca o resolve pelo handoff: com item pendente
+de PEDIDO DO ATENDENTE EM ABERTO a conversa continua (action="continue").
 
 ═══════════════════════════════════════
 O QUE VOCÊ NUNCA PODE FAZER:
@@ -1070,8 +1130,9 @@ O QUE VOCÊ NUNCA PODE FAZER:
   próprio cliente (não dá pra confirmar identidade por WhatsApp). Pode informar
   apenas: status/etapa do processo, tipo de serviço e quantidade de documentos.
 - NUNCA dê aconselhamento jurídico específico — papel do time humano.
-- NUNCA diga ao cliente para NÃO compartilhar senha, login ou documento com a
-  gente, nem chame isso de "risco de segurança" (ver SENHAS E ACESSOS).
+- NUNCA peça, ofereça receber nem incentive o envio de senha ou código
+  (gov.br, Meu INSS, ZapSign) — ver SENHAS, DOCUMENTOS E ACESSOS. Se ele
+  mandar mesmo assim, não dê sermão de "risco de segurança".
 - NUNCA contradiga, corrija ou desfaça o que um ATENDENTE HUMANO já disse ao
   cliente nesta conversa (ver ATENDENTE HUMANO NA CONVERSA).
 - NUNCA prometa que a Área do Cliente mostra documentos: ela mostra só a
@@ -1094,6 +1155,15 @@ ao cliente — nem se o nome aparecer no histórico (assinatura do próprio
 atendente, "aqui é o Fulano", nome escrito pelo cliente). O escritório fala com
 UMA voz: diga "nossa equipe", "o responsável pelo seu caso", "aqui do
 escritório". Nome próprio na resposta, só o do CLIENTE.
+BASTIDORES SÃO INVISÍVEIS PARA O CLIENTE. Para ele existe UM atendimento
+  só, do escritório. NUNCA diga que a conversa foi devolvida, que um atendente
+  passou ou "voltou" a conversa para você, que você "voltou", "assumiu", "foi
+  acionada" ou "está de volta". NUNCA fale em anotação, pedido em aberto, fila,
+  painel, sistema ou cobrança automática, nem "como o atendente pediu" / "a
+  equipe me pediu para te cobrar". Depois de uma devolução, siga direto do ponto
+  em que a conversa parou, como a mesma conversa ("Para seguir com o seu
+  processo, preciso de…"). A ÚNICA menção à equipe é a ponte quando VOCÊ
+  transfere (e no "assinei" nem ela).
 
 O QUE O ATENDENTE JÁ DISSE VALE — a equipe conhece o caso e o que o escritório
 consegue ou não fazer. Ela manda mais do que qualquer instrução genérica sua:
@@ -1118,12 +1188,11 @@ perguntou, (2) o que o cliente respondeu agora e (3) em que ponto do fluxo o
 caso está (ficha, state, se já é qualificado, quais documentos já vieram).
 Depois escolha UM destes caminhos, nesta ordem:
 
-A) O atendente PEDIU ALGO e o cliente ainda não entregou tudo → insista no que
-   foi pedido, de forma leve, usando as MESMAS palavras/orientações do
-   atendente. Ex.: atendente pediu "comprovante de residência e o nome do
+A) O atendente PEDIU ALGO (lista de documentos, prints, dados) ou há o bloco
+   PEDIDO DO ATENDENTE EM ABERTO → siga a seção PEDIDO DO ATENDENTE EM ABERTO
+   abaixo. Ex.: atendente pediu "comprovante de residência e o nome do
    hospital", cliente mandou só o hospital → agradeça, anote o hospital na
-   ficha e peça só o comprovante que falta. Mesmo limite da coleta: no
-   máximo 2 pedidos por item; depois anote como pendente e siga.
+   ficha e peça só o comprovante que falta.
 
 B) O cliente entregou o que o atendente pediu (ou parte) e o caso tem um fluxo
    seu para continuar → registre na ficha e SIGA O FLUXO DE ONDE ELE ESTÁ, sem
@@ -1143,40 +1212,118 @@ D) Nenhum dos casos acima: o atendente fez uma pergunta ou conversa cujo
    não está coberto pelas suas instruções, ou você não entendeu → devolva ao
    atendente: action="handoff", closeCategory="qualificado" se já era
    qualificado, e handoffReason dizendo o motivo real (ex.: "cliente respondeu
-   à pergunta do atendente Fulano — retomar"). Se couber, avise em UMA frase
+   à pergunta do atendente — retomar"). Se couber, avise em UMA frase
    curta que a equipe já vai continuar ("Perfeito! Já aviso aqui a equipe
    para continuar com você 😊"). NUNCA invente qual era a dúvida do atendente.
+   Atendente recente, conversa devolvida, cliente cadastrado ou arquivo
+   recebido, SOZINHOS, não levam a D.
 
 NUNCA devolva action="continue" com reply vazio sem silent=true: se não houver
 o que dizer, é o caminho D.
 
 ═══════════════════════════════════════
-SENHAS, DOCUMENTOS E ACESSOS DO CLIENTE (é seguro e é necessário):
+PEDIDO DO ATENDENTE EM ABERTO (lista pedida pela equipe, ou a LISTA que você mandou):
 ═══════════════════════════════════════
 
-O escritório PRECISA dos documentos e, muitas vezes, dos ACESSOS do cliente
-(login e senha do gov.br / Meu INSS, perícia, prontuário) para trabalhar o
-caso: a equipe entra nos sistemas por ele quando ele tem dificuldade.
-- NUNCA diga ao cliente para não compartilhar senha/login/documento com a
-  gente, nem que isso é "risco de segurança".
-- Cliente mandou senha/documento → agradeça, confirme o recebimento e anote na
-  FICHA que foi enviado (sem copiar a senha em si; ela fica no histórico).
-- Cliente pergunta se é seguro → "Pode mandar sim. Os dados ficam no nosso
-  sistema e a equipe usa só para cuidar do seu processo."
-- Cliente com dificuldade no gov.br / Meu INSS → ofereça que a equipe acessa
-  por ele (CPF + senha do gov.br) e faça handoff explicando.
-- RECEBER é seguro; EXPOR não: você continua sem devolver dados armazenados.
+O pedido vem do bloco "PEDIDO DO ATENDENTE EM ABERTO" nos DADOS DA CONVERSA
+(o texto citado com "|" é o que a equipe escreveu ou mandou) ou, sem o bloco,
+da última lista de um [atendente] no histórico que ninguém fechou depois.
+Origem detectada no histórico → confira se ela não foi fechada depois. Você
+ASSUME o pedido e conduz até completar, como coleta sua:
+- NA FICHA, um item por linha com o status (recebido / pendente / não tem /
+  manda depois), em TODA resposta até transferir.
+- Confira CADA arquivo pelo conteúdo (o título do documento) e diga qual item
+  ele é. Anexo NÃO aberto, que não coube ou antigo ("[anexo: PDF]") não conta
+  como item.
+- Uma mensagem só, nomeando o que chegou e o que AINDA FALTA: "Recebi o CNIS
+  e a Declaração ✅ Agora só falta o Resultado da Perícia." (action="continue",
+  state="coleta_documentos", closeCategory="nenhum"). NUNCA "recebi tudo",
+  "está completo" ou "todos os documentos"; na dúvida, "recebi N arquivos, a
+  equipe confere".
+- Item "(se tiver)" é opcional: "não tenho" fecha só ele e ele não segura a
+  transferência. "Mando depois" → acolha e MANTENHA o pedido aberto.
+- "ok", "obrigado", 👍 → silent=true (action="continue") ou UMA frase curta;
+  nunca handoff.
+- TRANSFIRA (action="handoff", state="encerrando", closeCategory="qualificado"
+  se já era, senão "transferido"; handoffReason = checklist do que chegou e do
+  que falta + motivo) SOMENTE quando: os itens obrigatórios chegaram ou o
+  cliente disse que não tem; ele não consegue um item obrigatório mesmo depois
+  de você orientar (app Meu INSS → 🔍 lupinha → nome do documento → baixar e
+  mandar por aqui); pergunta algo que só a equipe responde; ou pede uma pessoa.
+- Com item pendente: nunca se despeça, nunca encerre (resolve/disqualify) e não
+  prometa lembrar nem cobrar (quem lembra o cliente é o sistema).
+- Transferência no MEIO da lista que não encerra a coleta ("assinei" com a
+  LISTA já mandada; cliente ocupado ou que pede ligação) → keepRequest=true: o
+  pedido continua valendo quando a conversa voltar para você. Nas outras
+  transferências, keepRequest=false.
+
+MEU INSS: você NÃO pergunta "tem Meu INSS?". Na hora da lista — o cliente
+respondeu ao "tem Meu INSS?" do atendente, ou o card está em FALTA SENHA / COM
+SENHA ("Coluna do card no kanban") e ele respondeu a uma chamada da equipe — e
+se ela ainda não foi mandada nesta conversa: action="send_flow",
+flowName="LISTA DE DOCUMENTOS - INSS", state="coleta_documentos",
+closeCategory="nenhum", reply curto que inclua a linha:
+"se ainda não tiver o app, instale o Meu INSS e entre com a sua conta gov.br"
+Daí em diante é um PEDIDO EM ABERTO. Lista já mandada → não reenvie; responda
+só com o que falta.
+
+"ASSINEI" (contrato da ZapSign): agradeça SEM dizer que a assinatura foi
+validada. LISTA ainda não mandada → action="send_flow",
+flowName="LISTA DE DOCUMENTOS - INSS", handoffAfterFlow=true,
+handoffReason="cliente diz que assinou — conferir a assinatura na ZapSign",
+state="coleta_documentos", closeCategory="nenhum". O sistema passa a conversa
+à equipe depois do fluxo: NÃO escreva que vai transferir. LISTA já mandada →
+só o agradecimento e action="handoff", keepRequest=true, com o mesmo motivo +
+o que falta da lista. Cliente perdeu o link do contrato → reenvie EXATAMENTE o "Link enviado"
+dos DADOS (nunca monte outro).
+
+HONORÁRIOS: dúvida sobre os valores que cobramos → action="send_flow",
+flowName="Dúvidas sobre os honorários (valores que cobramos)". Continua em
+dúvida (percentual, negociação, cláusula) → handoff. Prazo, "vou ganhar?" ou
+cláusula específica → handoff; nunca prometa prazo nem resultado.
+
+═══════════════════════════════════════
+SENHAS, DOCUMENTOS E ACESSOS DO CLIENTE:
+═══════════════════════════════════════
+
+Documentos o cliente manda por AQUI (foto ou PDF). Senha e código, NUNCA:
+- NUNCA peça, ofereça receber nem incentive o envio de senha ou código
+  (gov.br, Meu INSS, ZapSign), nem diga que a equipe entra na conta dele.
+- Cliente mandou senha, CPF+senha ou código, ou pede que a equipe entre na
+  conta dele → NÃO repita e NÃO copie para a FICHA (anote só "cliente enviou
+  acesso do gov.br no chat"); diga em UMA frase que a equipe segue com ele por
+  aqui e use action="handoff" com
+  handoffReason="acesso gov.br enviado — login pela equipe".
+- "[senha omitida]" ou "[código omitido]" no texto do cliente = ele mandou uma
+  senha ou um código e o sistema escondeu o valor: siga o item acima (não
+  repita, não peça de novo, handoff com
+  handoffReason="acesso gov.br enviado — login pela equipe"). Não é falta de
+  envio nem texto dele.
+- Sem acesso ao gov.br / Meu INSS (esqueceu a senha, código no celular antigo,
+  bloqueio) → oriente UMA vez o caminho oficial ("Esqueci minha senha" no app
+  ou no site gov.br); se ainda não conseguir → handoff com o motivo.
+- Pergunta se é seguro mandar DOCUMENTO → "Pode mandar sim. Os dados ficam no
+  nosso sistema e a equipe usa só para cuidar do seu processo."
+- RECEBER documento é seguro; EXPOR não: você continua sem devolver dados armazenados.
 
 ═══════════════════════════════════════
 ÁREA DO CLIENTE (portal no site):
 ═══════════════════════════════════════
 
-A Área do Cliente (segurosparana.com.br, CPF + senha padrão segurosparana1)
-mostra SOMENTE a ETAPA/STATUS do processo e um FAQ. NÃO mostra documentos,
-NÃO permite enviar/baixar arquivos. Ao falar dela, diga apenas que por lá ele
-acompanha a etapa do processo. Documentos enviados: quem confirma é o
-atendente (lookup="documentos_enviados" dá só a quantidade). Enviar documento
-é por AQUI, pelo WhatsApp.
+A Área do Cliente (site segurosparana.com.br, login com o CPF) mostra SOMENTE
+a ETAPA/STATUS do processo e um FAQ. NÃO mostra documentos, NÃO permite
+enviar/baixar arquivos.
+- NUNCA informe senha de acesso e NUNCA dispare por conta própria o fluxo
+  "CONSULTAR PROCESSO - Área do cliente". Cliente quer entrar na Área do
+  Cliente ou pede a senha → diga que a equipe passa o acesso por aqui e
+  transfira: action="handoff", closeCategory="perguntas",
+  handoffReason="cliente pediu o acesso à Área do Cliente". Se ele só quer
+  saber a etapa → CONSULTA DE STATUS DO PROCESSO.
+- Ao falar dela, diga apenas que por lá ele acompanha a etapa do processo.
+- Documentos enviados: quem confirma é o atendente
+  (lookup="documentos_enviados" dá só a quantidade), exceto os itens de um
+  PEDIDO DO ATENDENTE EM ABERTO, que você confere. Enviar documento é por
+  AQUI, pelo WhatsApp.
 
 ═══════════════════════════════════════
 FICHA (memory):
@@ -1214,51 +1361,285 @@ REGRAS IMPORTANTES:
 - Seja humana, calorosa e natural.
 - WhatsApp: mensagens curtas.
 - RESPOSTAS CURTAS do cliente ("sim", "isso", "aham") = confirmação do que você perguntou.
-- Se não entendeu a mensagem, understood=false e peça com jeito para repetir.
-  (O número de tentativas seguidas sem entender está nos DADOS DA CONVERSA.)
+- understood=false SÓ para mensagem que você não consegue entender; aí peça
+  com jeito para repetir. O número de tentativas seguidas sem entender está
+  nos DADOS DA CONVERSA: na 3ª VEZ SEGUIDA sem entender (o número lá já é 2),
+  não peça de novo → action="handoff", closeCategory="transferido" (ou
+  "qualificado" se já era) e
+  handoffReason="IA não entendeu o cliente 3x seguidas" + o que você captou.
 `.trim();
 
 // ---------------------------------------------------------------------------
-// Bloco "ESTE ATENDIMENTO" — só FATOS do atendimento atual (conversationFacts).
+// FATOS do bloco dinâmico (ESTE ATENDIMENTO, PEDIDO DO ATENDENTE EM ABERTO,
+// CONVERSA DEVOLVIDA PELA EQUIPE) — 30/09/2026, "IA continua o pedido do
+// atendente".
 //
-// 26/09/2026 (auditoria do WhatsApp, D11): até aqui este bloco trazia fixa a
-// regra "cliente cadastrado ou arquivo recebido → NUNCA resolve, use handoff".
-// Por estar no código, ela valia mesmo contra as instruções publicadas: a
-// equipe não conseguia liberar o bot para responder "como está meu processo?"
-// (109 das 413 transferências de 09-22/09 eram de status). A regra de negócio
-// agora vive só nas instruções (CATEGORIAS DE ENCERRAMENTO), onde a equipe
-// edita. A v20 publicada já tem a MESMA proibição ("QUANDO NÃO USAR
-// action=resolve"), e o fallback STATIC_SYSTEM_PROMPT também: nada muda até a
-// v21 ser publicada.
-// recentAttendant (dono pegajoso, D5): alguém da equipe falou com o cliente
-// nos últimos 7 dias. Só o fato; como agir fica nas instruções (ATENDENTE
-// HUMANO NA CONVERSA). CRM antigo não manda o campo: a linha não aparece.
+// Regra desta seção: aqui só entra FATO, com texto neutro. Como agir fica nas
+// instruções publicadas (aba Instruções), que a equipe edita e que citam
+// estas strings AO PÉ DA LETRA ("COMO LER OS FATOS"). Mudou uma string aqui,
+// as instruções precisam mudar junto — a lista exata está no README.
+//
+// Por quê: em 26/09 (f9534f6) o cabeçalho deste bloco remetia às CATEGORIAS
+// DE ENCERRAMENTO e as linhas gritavam "JÁ ENVIOU", "CLIENTE CADASTRADO",
+// "ATENDENTE…". O handoff logo depois de fala de atendente foi de ~31% para
+// ~42%: texto que vai em TODA chamada pesa mais que as instruções. Pelo mesmo
+// motivo saiu daqui o aviso de "2x sem entender", que ainda contradizia a
+// regra publicada (3ª vez). Antes disso (26/09, D11) já tinha saído a regra
+// fixa "cadastrado/arquivo nunca é resolve", que a equipe não conseguia
+// mudar pelas instruções.
+// Nunca entra nome de atendente (o escritório fala com UMA voz, 23/09).
+// Datas e horas em Brasília: o Railway roda em UTC.
 // ---------------------------------------------------------------------------
-function renderConversationFacts(facts) {
-    if (!facts) return "";
-    const lines = [];
-    if (Number(facts.docsReceived) > 0) {
-        // Desde 25/09/2026 o CRM conta só foto/PDF do atendimento atual (sem
-        // áudio nem figurinha, sem atendimentos já encerrados).
-        lines.push(`- O cliente JÁ ENVIOU ${Number(facts.docsReceived)} arquivo(s) (foto/PDF) neste atendimento.`);
+const TZ_BR = "America/Sao_Paulo";
+const FMT_DIA_HORA_BR = new Intl.DateTimeFormat("pt-BR", {
+    timeZone: TZ_BR, day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+});
+// Mesmo teto do CRM para o texto do pedido (coluna collectRequest).
+const ATTENDANT_REQUEST_MAX_CHARS = 1500;
+
+function parseInstante(iso) {
+    if (iso == null || iso === "") return null;
+    const d = iso instanceof Date ? iso : new Date(iso);
+    return Number.isNaN(d.getTime()) ? null : d;
+}
+
+/** "30/09 às 10:05" (Brasília); null se a data for inválida. */
+function dataHoraBR(iso) {
+    const d = parseInstante(iso);
+    if (!d) return null;
+    // formatToParts em vez de format(): a pontuação entre data e hora muda
+    // de uma versão do ICU para outra ("30/09, 10:05" × "30/09 10:05").
+    const p = Object.fromEntries(FMT_DIA_HORA_BR.formatToParts(d).map((x) => [x.type, x.value]));
+    return `${p.day}/${p.month} às ${p.hour}:${p.minute}`;
+}
+
+function duracaoTexto(ms) {
+    const min = Math.max(0, Math.round(ms / 60000));
+    if (min < 60) return `${min} min`;
+    if (min < 48 * 60) return `${Math.round(min / 60)} h`;
+    return `${Math.round(min / 1440)} dias`;
+}
+
+/** "30/09 às 10:05 (há 3 h)"; null se a data for inválida. */
+function quandoBR(iso, now = Date.now()) {
+    const d = parseInstante(iso);
+    if (!d) return null;
+    return `${dataHoraBR(d)} (há ${duracaoTexto(now - d.getTime())})`;
+}
+
+/** Número inteiro ≥ 0 vindo do CRM, ou null se ausente/inválido. */
+function contagem(v) {
+    if (v == null || v === "" || typeof v === "boolean") return null;
+    const n = Number(v);
+    return Number.isFinite(n) && n >= 0 ? Math.floor(n) : null;
+}
+
+/** Texto de uma linha só (sem quebras), cortado em `max`. */
+function textoLinha(v, max) {
+    return clipText(String(v ?? "").replace(/[\r\n]+/g, " ").replace(/\s{2,}/g, " ").trim(), max) || "";
+}
+
+/**
+ * Texto livre da equipe citado dentro do prompt: cada linha com "  | " na
+ * frente e sem "═" (é a moldura dos cabeçalhos do prompt — um "═══" no texto
+ * do atendente viraria um bloco falso). Cortado no mesmo teto do CRM.
+ */
+function citacao(text, max = ATTENDANT_REQUEST_MAX_CHARS) {
+    const limpo = String(text ?? "").replace(/\r\n?/g, "\n").replace(/═+/g, "").replace(/\n{3,}/g, "\n\n").trim();
+    if (!limpo) return "";
+    return clipText(limpo, max).split("\n").map((l) => `  | ${l}`.trimEnd()).join("\n");
+}
+
+// Origem do pedido (collectRequestSource do CRM). O texto do botão Devolver o
+// cliente não viu; a IA precisa saber disso para não citá-lo como se ele
+// tivesse lido.
+const ORIGEM_PEDIDO = {
+    devolver: 'anotação do atendente no botão "Devolver ao bot" (o cliente NÃO viu este texto)',
+    lista_atendente: "mensagem de um atendente ao cliente (lista detectada pelo sistema no histórico)",
+    fluxo_ia: "fluxo enviado por você ao cliente",
+};
+
+/**
+ * Bloco "PEDIDO DO ATENDENTE EM ABERTO" (conversationFacts.attendantRequest
+ * do CRM: {text, source, at, returnedToBot, docsSinceOpened, nudges,
+ * flowName?}). Linha sem dado (CRM antigo, campo ausente) não aparece.
+ * Título fixo mesmo quando quem pediu foi a própria IA (fluxo_ia): as
+ * instruções citam este nome; a linha "Quem pediu" esclarece.
+ */
+function renderAttendantRequest(req, now = Date.now()) {
+    const texto = typeof req?.text === "string" ? req.text.trim() : "";
+    if (!texto) return "";
+    const source = Object.hasOwn(ORIGEM_PEDIDO, req.source) ? req.source : null;
+    const quem = source === "fluxo_ia" ? "você (bot)" : "um atendente da equipe";
+    const quando = quandoBR(req.at, now);
+    const nomeFluxo = source === "fluxo_ia" ? textoLinha(req.flowName, 80).replace(/"/g, "'") : "";
+    const linhas = [
+        "PEDIDO DO ATENDENTE EM ABERTO (fatos do sistema):",
+        `- Quem pediu: ${quem}${quando ? `, em ${quando}` : ""}.`,
+        `- Origem: ${source ? ORIGEM_PEDIDO[source] : "pedido registrado no sistema"}${nomeFluxo ? ` ("${nomeFluxo}")` : ""}.`,
+    ];
+    if (typeof req.returnedToBot === "boolean") {
+        linhas.push(`- Devolvido ao bot depois do pedido: ${req.returnedToBot ? "SIM" : "NÃO"}.`);
     }
-    if (facts.registeredClient) lines.push("- O número é de um CLIENTE CADASTRADO (tem processo no sistema).");
-    if (facts.recentAttendant) lines.push("- Um ATENDENTE da equipe conversou com este cliente nos últimos 7 dias.");
-    if (!lines.length) return "";
-    return `ESTE ATENDIMENTO (fatos — o que fazer com eles está nas instruções: CATEGORIAS DE ENCERRAMENTO e ATENDENTE HUMANO NA CONVERSA):
-${lines.join("\n")}
-`;
+    const docs = contagem(req.docsSinceOpened);
+    if (docs != null) linhas.push(`- Arquivos recebidos desde o pedido: ${docs}.`);
+    const nudges = contagem(req.nudges);
+    if (nudges != null) linhas.push(`- Cobranças automáticas já enviadas: ${nudges}.`);
+    linhas.push("- Texto do pedido:", citacao(texto));
+    return linhas.join("\n");
+}
+
+/**
+ * conversationFacts.contractPending = {link, sentAt}: último link da ZapSign
+ * mandado por um ATENDENTE com o card ainda em COLHER-ASSINATURA (ou sem
+ * card). O link vem copiado da mensagem do atendente pelo CRM; aqui só se
+ * confere que é um link e não se corta (link cortado não abre).
+ */
+function renderContractPending(cp) {
+    if (!cp || typeof cp !== "object") return "";
+    const bruto = typeof cp.link === "string" ? cp.link.trim().split(/\s+/)[0] : "";
+    const link = /^https?:\/\/\S+$/i.test(bruto) && bruto.length <= 500 ? bruto : "";
+    const quando = dataHoraBR(cp.sentAt);
+    if (!link && !quando) return "";
+    // Sem ponto final depois do link: o modelo copiaria o ponto junto.
+    return `- Contrato enviado pelo atendente${quando ? ` em ${quando}` : ""}, ainda sem confirmação de assinatura no kanban.${link ? ` Link enviado: ${link}` : ""}`;
+}
+
+/**
+ * Bloco "ESTE ATENDIMENTO" + bloco do pedido em aberto.
+ * `turn` = {docs, opened}: foto/PDF deste lote que chegaram ao micro e quantos
+ * foram abertos e anexados à mensagem (calculado em decide).
+ */
+function renderConversationFacts(facts, turn = null, now = Date.now()) {
+    const f = facts && typeof facts === "object" ? facts : {};
+    const t = { docs: contagem(turn?.docs) ?? 0, opened: contagem(turn?.opened) ?? 0 };
+    const lines = [];
+    // docsThisTurn (CRM novo) conta TODOS os foto/PDF desde a última saída,
+    // inclusive os que passaram do corte do lote; CRM antigo não manda e vale
+    // a contagem do mediaList feita aqui. O que não foi aberto é dito como
+    // NÃO aberto: a IA nunca pode "conferir" um arquivo que não viu.
+    const neste = Math.max(contagem(f.docsThisTurn) ?? 0, t.docs, t.opened);
+    if (neste > 0) {
+        const abertos = Math.min(t.opened, neste);
+        lines.push(`- Arquivos (foto/PDF) que chegaram NESTE turno: ${neste} — ${abertos} aberto(s) e anexado(s) a esta mensagem, ${neste - abertos} NÃO aberto(s).`);
+    }
+    // docsReceived (desde 25/09): foto/PDF do atendimento atual, INCLUINDO
+    // este turno — por isso a subtração.
+    const antes = Math.max(0, (contagem(f.docsReceived) ?? 0) - neste);
+    if (antes > 0) lines.push(`- Arquivos (foto/PDF) recebidos ANTES deste turno, neste atendimento: ${antes}.`);
+    if (f.burstTruncated === true) lines.push("- Parte deste lote não coube nesta chamada (mensagens/arquivos a mais).");
+    if (f.registeredClient) lines.push("- O número está vinculado a um cadastro no sistema (cliente com processo).");
+    // Coluna do card: o processInfo.etapa chega como "Processo iniciado" para
+    // a maioria dos cards em COLHER-ASSINATURA e não diz onde o caso está.
+    const coluna = typeof f.cardColumn === "string" ? textoLinha(f.cardColumn, 80).replace(/[.\s]+$/, "") : "";
+    if (coluna) lines.push(`- Coluna do card no kanban: ${coluna}.`);
+    const contrato = renderContractPending(f.contractPending);
+    if (contrato) lines.push(contrato);
+    if (f.recentAttendant) lines.push("- Houve mensagem de um atendente da equipe para este cliente nos últimos 7 dias.");
+
+    const blocos = [];
+    if (lines.length) blocos.push(`ESTE ATENDIMENTO (fatos do sistema):\n${lines.join("\n")}`);
+    const pedido = renderAttendantRequest(f.attendantRequest, now);
+    if (pedido) blocos.push(pedido);
+    return blocos.length ? `${blocos.join("\n\n")}\n` : "";
+}
+
+/**
+ * Conversa que a equipe devolveu ao bot (priorOutcome.returnedByAttendant do
+ * CRM: Devolver depois do último encerramento, até 7 dias). Substitui o bloco
+ * ATENDIMENTO ANTERIOR, que diz "foi encerrada, é uma RETOMADA" — falso aqui:
+ * o closeCategory velho veio de um handoff, e a conversa seguiu com a equipe.
+ */
+function renderReturnedByTeam(priorOutcome, now = Date.now()) {
+    if (priorOutcome?.returnedByAttendant !== true) return "";
+    const quando = quandoBR(priorOutcome.returnedAt, now);
+    const qual = priorOutcome.qualified === true ? "SIM" : priorOutcome.qualified === false ? "NÃO" : "—";
+    const categoria = priorOutcome.closeCategory ? textoLinha(priorOutcome.closeCategory, 60) : "—";
+    return [
+        "CONVERSA DEVOLVIDA PELA EQUIPE (fatos do sistema):",
+        `- Um atendente devolveu esta conversa para você${quando ? ` em ${quando}` : ""}. Ela NÃO foi encerrada.`,
+        `- qualificado: ${qual}`,
+        `- última categoria registrada (de uma transferência ou desfecho anterior): ${categoria}`,
+    ].join("\n") + "\n";
+}
+
+// Nota colada à mensagem do cliente quando a última saída foi de um atendente.
+// Só o fato (30/09): a versão anterior mandava "seguir o bloco CONVERSA QUE
+// ESTAVA COM O ATENDENTE" e empurrava para o caminho D (handoff). Não sai
+// depois de [mensagem automática]: as instruções mandam tratá-la como sua.
+const NOTA_ULTIMA_DO_ATENDENTE = "[FATO DO SISTEMA: a última mensagem enviada ao cliente antes desta foi de um [atendente] da equipe, não sua.]";
+
+function notaUltimaSaida(history) {
+    const lastOut = [...(Array.isArray(history) ? history : [])].reverse().find((h) => h && h.role !== "client");
+    return lastOut?.role === "agent" ? NOTA_ULTIMA_DO_ATENDENTE : null;
+}
+
+// Foto/PDF que conta como documento (mesma regra do isClientDocumentMime do
+// CRM): figurinha (image/webp) não conta.
+const isDocMime = (m) => (m.startsWith("image/") && m !== "image/webp") || m === "application/pdf";
+
+/** Nome original do anexo (mediaList[].fileName do CRM); "midia.*" = sem nome. */
+function nomeDoAnexo(raw) {
+    if (typeof raw !== "string") return "";
+    const base = (raw.split(/[\\/]/).pop() || "").replace(/["\r\n[\]]/g, "").trim();
+    if (!base || /^midia\./i.test(base)) return "";
+    return base.length > 80 ? `${base.slice(0, 80)}…` : base;
+}
+
+/** Rótulo antes de cada anexo aberto: "[anexo 2 de 5: PDF "CNIS.pdf"]". */
+function rotuloAnexo(k, n, isPdf, fileName) {
+    const nome = nomeDoAnexo(fileName);
+    return `[anexo ${k} de ${n}: ${isPdf ? "PDF" : "imagem"}${nome ? ` "${nome}"` : ""}]`;
+}
+
+/**
+ * Início do turno: reinicia ou não a etapa, a ficha e o histórico.
+ *
+ * Etapa vazia (Encerrar pelo painel zera) ou "encerrando" (depois de um
+ * handoff) marcava "atendimento NOVO": etapa "saudacao" e, sem desfecho
+ * anterior, ficha e histórico ZERADOS. Numa conversa que estava com a equipe
+ * isso apagava justamente a lista que o atendente tinha pedido (30/09/2026).
+ * Com pedido em aberto, conversa devolvida ou atendente nos últimos 7 dias,
+ * nada é zerado e a etapa fica "suspensa" (o bloco dinâmico diz "nenhuma em
+ * andamento"). Sem esses fatos, o comportamento é o de antes (30/07: com
+ * desfecho anterior, ficha e histórico ficam; sem desfecho, zera tudo).
+ */
+function resolveTurnStart({ state = null, memory = null, history = [], priorOutcome = null, conversationFacts = null } = {}) {
+    const hist = Array.isArray(history) ? history : [];
+    const pedido = conversationFacts?.attendantRequest;
+    const continuaComEquipe = Boolean(
+        (typeof pedido?.text === "string" && pedido.text.trim())
+        || priorOutcome?.returnedByAttendant === true
+        || conversationFacts?.recentAttendant === true,
+    );
+    const novo = !state || state === "encerrando";
+    if (!novo) return { effState: state, effMemory: memory, effHistory: hist, etapaSuspensa: false, motivo: null };
+    if (continuaComEquipe) return { effState: null, effMemory: memory, effHistory: hist, etapaSuspensa: true, motivo: "voltou_da_equipe" };
+    const temDesfecho = Boolean(priorOutcome && (priorOutcome.qualified != null || priorOutcome.closeCategory));
+    return temDesfecho
+        ? { effState: "saudacao", effMemory: memory, effHistory: hist, etapaSuspensa: false, motivo: "retomada" }
+        : { effState: "saudacao", effMemory: null, effHistory: [], etapaSuspensa: false, motivo: "novo" };
 }
 
 // ---------------------------------------------------------------------------
 // Bloco DINÂMICO do system prompt — tudo que muda por conversa/mensagem.
+// turnMedia/etapaSuspensa/estadoAnterior/hasHistory vêm de decide (30/09);
+// `now` só existe para os testes.
 // ---------------------------------------------------------------------------
-function buildDynamicContext({ contact, processInfo, memory, state, failCount, business, flows, priorOutcome, signature, conversationFacts }) {
+function buildDynamicContext({
+    contact, processInfo, memory, state, failCount, business, flows, priorOutcome, signature, conversationFacts,
+    turnMedia = null, etapaSuspensa = false, estadoAnterior = null, hasHistory = false, now = Date.now(),
+}) {
     const nome = contact?.name ? contact.name.split(" ")[0] : null;
 
     const flowsList = Array.isArray(flows) && flows.length
         ? flows.map((f) => `- "${f.name}": ${f.description}`).join("\n")
         : "(nenhum fluxo cadastrado)";
+
+    const devolvida = renderReturnedByTeam(priorOutcome, now);
+    const etapa = etapaSuspensa
+        ? `nenhuma em andamento (última registrada: ${estadoAnterior || "—"}; depois dela a conversa esteve com a equipe)`
+        : (state || "saudacao");
 
     return `
 ═══════════════════════════════════════
@@ -1284,7 +1665,7 @@ ${processInfo ? `- Cliente CADASTRADO no sistema.
 FLUXOS DISPONÍVEIS:
 ${flowsList}
 
-${priorOutcome && (priorOutcome.closeCategory || priorOutcome.qualified != null) ? `ATENDIMENTO ANTERIOR (este contato JÁ FOI ATENDIDO e aquela conversa foi encerrada):
+${devolvida || (priorOutcome && (priorOutcome.closeCategory || priorOutcome.qualified != null) ? `ATENDIMENTO ANTERIOR (este contato JÁ FOI ATENDIDO e aquela conversa foi encerrada):
 - qualificado: ${priorOutcome.qualified === true ? "SIM" : priorOutcome.qualified === false ? "NÃO" : "—"}
 - categoria do encerramento: ${priorOutcome.closeCategory ?? "—"}
 Isto é uma RETOMADA, não um contato novo. NÃO recomece a saudação nem repita a
@@ -1296,7 +1677,7 @@ ${priorOutcome.qualified === false ? `ATENÇÃO — o caso anterior foi DESQUALI
 reabra a triagem para o MESMO caso (reafirme o motivo com empatia e encerre).
 Triagem de novo SOMENTE se for um acidente DIFERENTE do que está na ficha — e,
 nesse caso, sem repetir perguntas que a ficha já responde.` : ""}
-` : ""}
+` : "")}
 ${signature ? `ASSINATURA EM ANDAMENTO (o contrato JÁ ESTÁ com o cliente — não é triagem):
 - Documentos: procurações + contrato + declaração (assinatura eletrônica no nosso site)
 - Enviado por: ${signature.sentBy} em ${signature.sentAt ?? "—"}
@@ -1310,16 +1691,13 @@ REGRAS ENQUANTO A ASSINATURA ESTIVER PENDENTE:
 - Se ele disser que JÁ ASSINOU, que não conseguiu, que não sabe mexer, que quer desistir, ou pedir pra falar com alguém: action="handoff" imediatamente (handoffReason explicando).
 - Assunto que não é o documento/assinatura: responda em UMA frase e ofereça o atendente (handoff se ele aceitar ou insistir).
 ` : ""}
-${renderConversationFacts(conversationFacts)}
+${renderConversationFacts(conversationFacts, turnMedia, now)}
 FICHA ATUAL (fatos já coletados — NUNCA pergunte de novo o que está aqui):
-${memory || "(vazia — conversa nova)"}
+${memory || (hasHistory ? "(vazia)" : "(vazia — conversa nova)")}
 
-ETAPA ATUAL DA CONVERSA: ${state || "saudacao"}
+ETAPA ATUAL DA CONVERSA: ${etapa}
 
 Tentativas seguidas sem entender até agora: ${failCount || 0}.
-${(failCount || 0) >= 1 ? `ATENÇÃO: você JÁ não entendeu a mensagem anterior deste cliente. Se também não
-entender esta, NÃO peça para repetir de novo — passe para a equipe com
-action="handoff" e handoffReason="IA não entendeu o cliente 2x seguidas".` : ""}
 ${business && !business.open ? `HORÁRIO: estamos FORA do horário comercial. Faça a triagem normalmente,
 mas ao transferir avise: "Nossa equipe responderá ${business.reopens}."` : ""}
 `.trim();
@@ -1357,7 +1735,25 @@ const SECRET_FOR_BRAIN = process.env.BOT_SECRET || "";
 const BRAIN_TTL_MS = Number(process.env.BRAIN_TTL_MS || 5 * 60 * 1000);
 const BRAIN_TIMEOUT_MS = 8000;
 
-let brainCache = { text: null, fetchedAt: 0, version: null, playbookVersion: null };
+// stale (30/09/2026): a última busca no CRM falhou e o texto em uso é o que
+// já estava em memória (pode ser de uma versão anterior das instruções). Vai
+// no brain da resposta do /reply para o log wa_bot não datar errado a versão.
+let brainCache = { text: null, fetchedAt: 0, version: null, playbookVersion: null, stale: false };
+
+// Qual prompt respondeu (vai no /reply como `brain` e o CRM grava no log
+// wa_bot): sem isso não dava para saber sob qual versão das instruções uma
+// decisão foi tomada.
+function brainInfoFallback() {
+    return { source: "fallback", instructionsVersion: null, playbookVersion: null, stale: false };
+}
+function brainInfoCrm() {
+    return {
+        source: "crm",
+        instructionsVersion: brainCache.version ?? null,
+        playbookVersion: brainCache.playbookVersion ?? null,
+        stale: brainCache.stale === true,
+    };
+}
 
 /**
  * Formata as regras aprendidas como um bloco de texto para o prompt.
@@ -1404,13 +1800,14 @@ async function fetchBrain() {
 }
 
 /**
- * Texto estático do system prompt: remoto quando disponível, hardcoded senão.
- * Nunca lança — na dúvida devolve o fallback.
+ * Texto estático do system prompt (remoto quando disponível, hardcoded senão)
+ * e de onde ele veio ({ text, info }). Nunca lança — na dúvida devolve o
+ * fallback.
  */
-async function getStaticPrompt() {
+async function getBrainPrompt() {
     const fresh = Date.now() - brainCache.fetchedAt < BRAIN_TTL_MS;
-    if (brainCache.text && fresh) return brainCache.text;
-    if (!BRAIN_URL || !SECRET_FOR_BRAIN) return STATIC_SYSTEM_PROMPT;
+    if (brainCache.text && fresh) return { text: brainCache.text, info: brainInfoCrm() };
+    if (!BRAIN_URL || !SECRET_FOR_BRAIN) return { text: STATIC_SYSTEM_PROMPT, info: brainInfoFallback() };
 
     try {
         const data = await fetchBrain();
@@ -1430,6 +1827,7 @@ async function getStaticPrompt() {
             fetchedAt: Date.now(),
             version: data?.instructions?.version ?? null,
             playbookVersion: data?.playbook?.version ?? null,
+            stale: false,
         };
         console.log(
             `[BRAIN] prompt carregado do CRM: instruções v${brainCache.version}` +
@@ -1437,22 +1835,38 @@ async function getStaticPrompt() {
             (data?.examples?.count ? `, ${data.examples.count} exemplos revisados` : ", sem exemplos") +
             ` — ${text.length} chars`,
         );
-        return text;
+        return { text, info: brainInfoCrm() };
     } catch (err) {
         console.error("[BRAIN] Falha ao buscar o prompt no CRM — usando o embutido:", err.message);
         // Marca a tentativa para não martelar o CRM a cada mensagem quando ele
         // estiver fora do ar; o texto em memória (se houver) continua valendo.
         brainCache.fetchedAt = Date.now();
-        return brainCache.text || STATIC_SYSTEM_PROMPT;
+        if (brainCache.text) {
+            brainCache.stale = true;
+            return { text: brainCache.text, info: brainInfoCrm() };
+        }
+        return { text: STATIC_SYSTEM_PROMPT, info: brainInfoFallback() };
     }
 }
 
+/** Só o texto (diagnóstico de fora; ver module.exports). */
+async function getStaticPrompt() {
+    return (await getBrainPrompt()).text;
+}
+
+/**
+ * Monta o array `system` (bloco estático cacheado + dinâmico) e devolve junto
+ * a origem do prompt estático (promptInfo → `brain` na resposta do /reply).
+ */
 async function buildSystemBlocks(params) {
-    const staticText = await getStaticPrompt();
-    return [
-        { type: "text", text: staticText, cache_control: { type: "ephemeral" } },
-        { type: "text", text: buildDynamicContext(params) },
-    ];
+    const { text: staticText, info } = await getBrainPrompt();
+    return {
+        blocks: [
+            { type: "text", text: staticText, cache_control: { type: "ephemeral" } },
+            { type: "text", text: buildDynamicContext(params) },
+        ],
+        promptInfo: info,
+    };
 }
 
 // ---------------------------------------------------------------------------
@@ -1615,7 +2029,7 @@ function sanitizeReply(text) {
 // completas; item que parece fragmento de JSON ou token solto do schema é
 // descartado aqui, na fonte.
 const SCHEMA_TOKENS = new Set([
-    "reply", "replies", "action", "flowname", "closecategory", "handoffreason",
+    "reply", "replies", "action", "flowname", "closecategory", "handoffreason", "handoffafterflow", "keeprequest",
     "lookup", "memory", "state", "intent", "emotion", "urgent", "understood",
     "confidence", "optout", "appliedrules", "silent", "usage",
     "continue", "qualify", "disqualify", "handoff", "send_flow", "sendflow",
@@ -1643,7 +2057,7 @@ const REASONING_PATTERNS = [
     // Rótulo de deliberação em pt-BR com dois-pontos ("categoria: ...").
     /^\s*(categoria|avalia[çc][ãa]o|an[áa]lise|racioc[íi]nio|delibera[çc][ãa]o|decis[ãa]o|passo|nota interna|resumo interno)\s*[:=]/i,
     // Atribuição de campo do schema no meio da prosa ("state=coleta_documentos").
-    /(state|action|closeCategory|handoffReason|flowName|replies|intent|silent|confidence|memory|rationale)\s*[:=]\s*["'\[]?[a-z_]/i,
+    /(state|action|closeCategory|handoffReason|handoffAfterFlow|keepRequest|flowName|replies|intent|silent|confidence|memory|rationale)\s*[:=]\s*["'\[]?[a-z_]/i,
     // Rascunho em inglês ("let's write actual reply", "final json").
     /(let'?s|final json|actual reply|i (should|will|need to)|we (should|need to))/i,
     // Chave de JSON solta no meio do texto — mensagem de WhatsApp não tem { }.
@@ -1712,43 +2126,26 @@ async function decide({
     const model = process.env.MODEL || "claude-sonnet-5";
     const budget = { deadline: deadline || undefined, signal: signal || undefined };
 
-    // ---- Auto-reset de ticket encerrado -------------------------------------
-    // Se a etapa que chega é "encerrando", o atendimento ANTERIOR já terminou
-    // (qualificado, não qualificado ou transferido). Uma mensagem nova aqui =
-    // NOVO atendimento. Zeramos memória, estado e histórico para o bot não
-    // ficar preso no contexto velho nem responder como se ainda estivesse
-    // fechando. A ficha do cliente (nome/CPF/etapa) NÃO se perde: ela vem do
-    // card via processInfo a cada chamada. Devolver memory="" + state="saudacao"
-    // faz o app Next persistir o reset.
-    let effMemory = memory;
-    let effState = state;
-    let effHistory = history;
-    // Início de um NOVO atendimento. Dois casos:
-    //  - state="encerrando": o ticket anterior acabou nesta mesma conversa.
-    //  - state vazio/null: o encerramento (atendente ou desqualificação) JÁ
-    //    zerou memória e estado, mas o histórico de mensagens antigas ainda
-    //    chega aqui — e faria a IA repetir o assunto velho ("já te encaminhei").
-    //
-    // EXCEÇÃO (30/07/2026, caso naircardoso260): quando há priorOutcome
-    // conhecido (qualificado OU desqualificado), a FICHA e o HISTÓRICO são
-    // justamente o que o prompt manda consultar ("o motivo está na FICHA",
-    // "não repita a triagem já feita"). Zerar aqui contradizia o prompt: a
-    // cliente desqualificada respondia ao encerramento, a IA voltava amnésica,
-    // reabria a triagem e desqualificava DE NOVO — 3 desqualificações na mesma
-    // tarde. Com desfecho anterior, só o state recomeça; ficha e histórico
-    // ficam. Sem desfecho (conversa realmente nova), zera tudo como antes.
-    const novoAtendimento = !state || state === "encerrando";
-    if (novoAtendimento) {
-        const temDesfecho = priorOutcome
-            && (priorOutcome.qualified != null || priorOutcome.closeCategory);
-        effState = "saudacao";
-        if (temDesfecho) {
-            console.log(`[BOT] ${contact?.phone ?? "?"} → retomada pós-desfecho (ficha e histórico PRESERVADOS; state reiniciado).`);
-        } else {
-            console.log(`[BOT] ${contact?.phone ?? "?"} → NOVO atendimento (memória e histórico anteriores zerados).`);
-            effMemory = null;
-            effHistory = [];
-        }
+    // ---- Início do turno: novo atendimento, retomada ou volta da equipe ----
+    // Etapa "encerrando" ou vazia = o atendimento anterior terminou nesta
+    // conversa. Sem desfecho anterior, ficha e histórico são zerados (o bot
+    // não fica preso no contexto velho, "já te encaminhei"); com desfecho, só
+    // a etapa recomeça (30/07/2026, caso naircardoso260: zerar a ficha fazia a
+    // IA desqualificar DE NOVO a mesma cliente). Conversa que estava com a
+    // equipe (pedido em aberto, devolvida, atendente nos últimos 7 dias) não
+    // recomeça nada (30/09/2026). Regras em resolveTurnStart; a ficha do
+    // cadastro (nome/CPF/etapa) não se perde: vem do card via processInfo.
+    const inicio = resolveTurnStart({ state, memory, history, priorOutcome, conversationFacts });
+    let effMemory = inicio.effMemory;
+    const effState = inicio.effState;
+    const effHistory = inicio.effHistory;
+    const etapaSuspensa = inicio.etapaSuspensa;
+    if (inicio.motivo === "voltou_da_equipe") {
+        console.log(`[BOT] ${contact?.phone ?? "?"} → conversa voltou da equipe: etapa não reiniciada (última: ${state ?? "—"}); ficha e histórico PRESERVADOS.`);
+    } else if (inicio.motivo === "retomada") {
+        console.log(`[BOT] ${contact?.phone ?? "?"} → retomada pós-desfecho (ficha e histórico PRESERVADOS; state reiniciado).`);
+    } else if (inicio.motivo === "novo") {
+        console.log(`[BOT] ${contact?.phone ?? "?"} → NOVO atendimento (memória e histórico anteriores zerados).`);
     }
 
     // Ficha estourou o limite? Compacta ANTES de montar o prompt (o resultado
@@ -1787,6 +2184,13 @@ async function decide({
     // WhatsApp manda "audio/ogg; codecs=opus" — parâmetro após ";" derruba a
     // validação de mimeType das APIs.
     const baseMimeOf = (item) => String(item?.mimeType || "").split(";")[0].trim();
+    // Foto/PDF deste lote (30/09/2026): cada um aberto ganha o rótulo
+    // "[anexo k de N: …]" com o nome original, para a IA dizer QUAL item da
+    // lista cada arquivo é; N e os abertos vão também para o bloco ESTE
+    // ATENDIMENTO (turnMedia).
+    const docTotal = mediaItems.filter((i) => i?.url && isDocMime(baseMimeOf(i))).length;
+    let docSeq = 0;
+    let docsOpened = 0;
 
     // Áudios do lote transcritos EM PARALELO (26/09/2026): antes era um por vez
     // dentro do laço, e cada áudio somava ~3-7 s na resposta (p50 com áudio
@@ -1822,6 +2226,8 @@ async function decide({
             // receberia uma URL morta e a falha viraria loop. Teto por arquivo
             // (limite da API: ~5MB imagem, 32MB PDF) e teto somado do lote.
             const isPdf = baseMime === "application/pdf";
+            const isDoc = isDocMime(baseMime);
+            const k = isDoc ? ++docSeq : null;
             const MAX_BYTES = isPdf ? 30 * 1024 * 1024 : 4.5 * 1024 * 1024;
             if (mediaBlocks.length >= MAX_MEDIA_BLOCKS) { skippedForCaps++; continue; }
             // Teto de 15 s por arquivo, que também cai se o /reply abortar.
@@ -1836,9 +2242,13 @@ async function decide({
                 }
                 if (mediaBytes + buf.length > MAX_TOTAL_MEDIA_BYTES) { skippedForCaps++; continue; }
                 mediaBytes += buf.length;
-                mediaBlocks.push(isPdf
-                    ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
-                    : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } });
+                mediaBlocks.push({
+                    label: isDoc ? rotuloAnexo(k, docTotal, isPdf, item.fileName) : null,
+                    block: isPdf
+                        ? { type: "document", source: { type: "base64", media_type: "application/pdf", data: buf.toString("base64") } }
+                        : { type: "image", source: { type: "base64", media_type: baseMime, data: buf.toString("base64") } },
+                });
+                if (isDoc) docsOpened++;
             } catch (err) {
                 console.error("[BOT] Falha ao baixar imagem/PDF:", err.message);
                 mediaNotes.push("[um arquivo do cliente não pôde ser aberto por falha técnica — confirme o recebimento e, se o conteúdo for necessário, peça para reenviar]");
@@ -1868,21 +2278,30 @@ async function decide({
             handoffReason: undefined,
             lookup: null,
             memory: String(effMemory ?? ""),
-            state: String(effState ?? "saudacao"),
+            // Etapa suspensa (voltou da equipe): devolve a etapa como chegou
+            // ("" = o CRM mantém a que tinha), nunca "saudacao".
+            state: etapaSuspensa ? String(state ?? "") : String(effState ?? "saudacao"),
             intent: "outro",
             emotion: "neutro",
             understood: false,
             confidence: 0.3,
             transcripts: [],
             transcribeUsage,
+            rationale: "",
+            model,
+            brain: null,
+            handoffAfterFlow: false,
+            keepRequest: false,
         };
     }
 
     if (mediaBlocks.length) {
         mediaNotes.unshift(`[o cliente enviou ${mediaBlocks.length === 1 ? "o arquivo anexo" : `os ${mediaBlocks.length} arquivos anexos`} nesta mensagem — analise o conteúdo REAL de cada um e conduza conforme as instruções; NÃO presuma conteúdo que não está visível nem afirme ter recebido documento que não está entre os anexos]`);
     }
+    // Neutra (30/09/2026): "o atendente humano vê todos" empurrava para o
+    // handoff; o fato é só que estes não foram vistos.
     if (skippedForCaps > 0) {
-        mediaNotes.push(`[além dos anexos abertos, o cliente enviou mais ${skippedForCaps} arquivo(s) que NÃO couberam nesta chamada — NÃO afirme tê-los lido; o atendente humano vê todos]`);
+        mediaNotes.push(`[mais ${skippedForCaps} arquivo(s) deste turno NÃO foram abertos nesta chamada (limite por mensagem) — você não viu o conteúdo deles]`);
     }
     for (const note of mediaNotes) {
         clientText = [clientText, note].filter(Boolean).join("\n\n");
@@ -1897,10 +2316,8 @@ async function decide({
 
     // Mensagem atual + notas de validação do sistema.
     const parts = [clientText || "(mensagem vazia)"];
-    const lastOut = [...(effHistory || [])].reverse().find((h) => h.role !== "client");
-    if (lastOut && lastOut.role !== "bot") {
-        parts.push(`[CONTEXTO DO SISTEMA: a última mensagem enviada ao cliente antes desta foi ${authorTag(lastOut)}, NÃO sua. O cliente provavelmente está respondendo a ela — siga o bloco "CONVERSA QUE ESTAVA COM O ATENDENTE" das instruções.]`);
-    }
+    const notaAtendente = notaUltimaSaida(effHistory);
+    if (notaAtendente) parts.push(notaAtendente);
     for (const note of validationNotes(clientText)) parts.push(note);
     if (lookupResult) {
         parts.push(`RESULTADO DA CONSULTA QUE VOCÊ PEDIU (${lookupResult.kind}):\n${JSON.stringify(lookupResult.data)}\nUse este resultado para responder AGORA (não peça a mesma consulta de novo).`);
@@ -1910,8 +2327,21 @@ async function decide({
     messages.push({
         role: "user",
         content: mediaBlocks.length
-            ? [...mediaBlocks, { type: "text", text: parts.join("\n\n") }]
+            ? [
+                ...mediaBlocks.flatMap(({ label, block }) => (label ? [{ type: "text", text: label }, block] : [block])),
+                { type: "text", text: parts.join("\n\n") },
+            ]
             : parts.join("\n\n"),
+    });
+
+    // Bloco estático (remoto ou fallback) + dinâmico; promptInfo vai no
+    // `brain` da resposta.
+    const { blocks: system, promptInfo } = await buildSystemBlocks({
+        contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature, conversationFacts,
+        turnMedia: { docs: docTotal, opened: docsOpened },
+        etapaSuspensa,
+        estadoAnterior: state,
+        hasHistory: effHistory.length > 0,
     });
 
     const { data: parsed, response } = await callClaudeStructured({
@@ -1924,7 +2354,7 @@ async function decide({
         // (env), deixar explícito garante o comportamento em qualquer troca.
         // display "omitted" (padrão): o raciocínio nem volta na resposta.
         thinking: thinkingFor(model),
-        system: await buildSystemBlocks({ contact, processInfo, memory: effMemory, state: effState, failCount, business, flows, priorOutcome, signature, conversationFacts }),
+        system,
         output_config: {
             format: { type: "json_schema", schema: responseSchema },
         },
@@ -1967,7 +2397,9 @@ async function decide({
         return r;
     })();
 
-    const estadoFinal = STATES.includes(parsed.state) ? parsed.state : String(effState ?? "saudacao");
+    const estadoFinal = STATES.includes(parsed.state)
+        ? parsed.state
+        : etapaSuspensa ? String(state ?? "") : String(effState ?? "saudacao");
     const rawReplies = Array.isArray(parsed.replies)
         ? parsed.replies.map((r) => sanitizeReply(r)).filter(Boolean)
         : [];
@@ -1992,6 +2424,20 @@ async function decide({
         );
     }
 
+    const action = ["continue", "qualify", "disqualify", "handoff", "lookup", "send_flow", "resolve"].includes(parsed.action)
+        ? parsed.action
+        : "continue";
+    const flowName = parsed.flowName ? String(parsed.flowName).trim() : null;
+    const handoffReason = parsed.handoffReason ? String(parsed.handoffReason) : undefined;
+    const handoffAfterFlow = sanitizeHandoffAfterFlow({ action, flowName, handoffReason, handoffAfterFlow: parsed.handoffAfterFlow });
+    if (parsed.handoffAfterFlow === true && !handoffAfterFlow) {
+        console.warn(`[BOT] handoffAfterFlow descartado: exige action=send_flow + flowName + handoffReason (action=${action}, flowName=${flowName ?? "—"}, motivo=${handoffReason ? "sim" : "não"}).`);
+    }
+    const keepRequest = sanitizeKeepRequest({ action, keepRequest: parsed.keepRequest });
+    if (parsed.keepRequest === true && !keepRequest) {
+        console.warn(`[BOT] keepRequest descartado: só vale com action=handoff (action=${action}).`);
+    }
+
     return {
         usage,
         // Sinaliza o descarte pro CRM: sem texto o fluxo cai pra fila humana, e
@@ -1999,12 +2445,14 @@ async function decide({
         leaked,
         reply: cleanReply,
         replies: cleanReplies,
-        action: ["continue", "qualify", "disqualify", "handoff", "lookup", "send_flow", "resolve"].includes(parsed.action)
-            ? parsed.action
-            : "continue",
-        flowName: parsed.flowName ? String(parsed.flowName).trim() : null,
+        action,
+        flowName,
         closeCategory: parsed.closeCategory && parsed.closeCategory !== "nenhum" ? String(parsed.closeCategory) : null,
-        handoffReason: parsed.handoffReason ? String(parsed.handoffReason) : undefined,
+        handoffReason,
+        // Fluxo + transferência sem ponte (caso "assinei"; ver responseSchema).
+        handoffAfterFlow,
+        // Transferência que mantém o pedido em aberto (ver responseSchema).
+        keepRequest,
         lookup: parsed.lookup && parsed.lookup !== "nenhum" ? String(parsed.lookup) : null,
         memory: String(parsed.memory ?? effMemory ?? "").slice(0, MEMORY_HARD_CHARS),
         state: estadoFinal,
@@ -2030,6 +2478,13 @@ async function decide({
         // Custo das transcrições deste turno (CRM novo grava wa_transcribe;
         // o antigo ignora o campo).
         transcribeUsage,
+        // Raciocínio da IA (30/09/2026): SÓ para o log wa_bot do CRM, que
+        // corta de novo e mascara dígitos. NUNCA é enviado ao cliente.
+        rationale: clipText(rationale, 600) || "",
+        model,
+        // Qual prompt estático respondeu: { source: "crm"|"fallback",
+        // instructionsVersion, playbookVersion, stale }.
+        brain: promptInfo,
     };
 }
 
@@ -2208,15 +2663,25 @@ const followupSchema = {
     additionalProperties: false,
 };
 
-async function followupDecision({ contact, history, memory, state }) {
-    const model = process.env.MODEL;
+// `deadline`/`signal` (opcionais) vêm do index.js, pelo header
+// x-bot-budget-ms do CRM, como no /reply: estourou o prazo ou o CRM
+// desconectou → a chamada aborta (504) em vez de seguir pagando a IA.
+async function followupDecision({ contact, history, memory, state, pendingRequest = null }, { deadline, signal } = {}) {
+    // Pedido em aberto (30/09/2026): cobrança da lista, com regras próprias
+    // (nunca despedida nem encerramento). Ver pendingFollowup.
+    const pedido = parsePendingRequest(pendingRequest);
+    if (pedido) return pendingFollowup({ contact, history, memory, state, pendingRequest: pedido }, { deadline, signal });
+
+    // Sem default o modo antigo ia para a API com model undefined (400) se o
+    // MODEL não estivesse setado; mesmo padrão das outras rotas.
+    const model = process.env.MODEL || "claude-sonnet-5";
 
     const transcript = (Array.isArray(history) ? history : [])
         .slice(-20)
         .map((h) => `${h.role === "client" ? "Cliente" : h.role === "agent" ? "Atendente" : "Bot"}: ${h.text}`)
         .join("\n");
 
-    const { data: out } = await callClaudeStructured({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 250,
         system: [
@@ -2250,16 +2715,251 @@ async function followupDecision({ contact, history, memory, state }) {
                 (memory ? `Ficha da conversa: ${clipText(memory, 1200)}\n` : "") +
                 (transcript ? `Conversa:\n${transcript}` : "Sem histórico disponível."),
         }],
-    }, "decisão de follow-up");
+    }, "decisão de follow-up", null, { deadline, signal });
 
     const action = out.action === "nudge" ? "nudge" : "close";
     return {
+        // mode (30/09/2026): o CRM distingue a resposta deste modo da cobrança
+        // de pedido em aberto (mode "pending"); micro antigo não mandava nada.
+        mode: "followup",
         action,
         // Em close a message também pode vir preenchida: é a frase única e suave
         // de fecho quando ninguém se despediu ainda (vazia = silêncio total).
         message: String(out.message ?? "").trim(),
         reason: String(out.reason ?? "").trim(),
+        // ~300 chamadas por semana saíam sem custo no Canto da IA: o CRM grava
+        // este usage no log wa_followup.
+        usage: usageFrom(response, model),
     };
+}
+
+// ---------------------------------------------------------------------------
+// COBRANÇA DO PEDIDO EM ABERTO (30/09/2026, decisão 2 do dono) — o cron do CRM
+// chama o /followup-decision com `pendingRequest` quando a conversa tem um
+// pedido do atendente em aberto (lista de documentos etc.) e o cliente ficou
+// em silêncio. A IA decide:
+//   - "nudge": manda um lembrete (texto dela; o CRM envia por
+//     sendSystemWhatsApp, com opt-out, cooldown de 6 h, janela de 24 h,
+//     7h–21h e marcapasso — nada disso é afrouxado aqui);
+//   - "silent": não manda nada nesta rodada (o cliente marcou hora, está
+//     providenciando, está impedido);
+//   - "handoff": nada obrigatório pendente, ou o cliente não consegue → o CRM
+//     transfere ao dono com o que falta (`missing`).
+// Nunca despedida, encerramento nem standby com pedido aberto: é por isso que
+// o modo antigo (nudge/close) não serve aqui — ele manda "close" quando o
+// cliente combina "mando depois", o oposto do que o dono decidiu.
+//
+// O texto de PENDING_FOLLOWUP_SYSTEM espelha a seção SILÊNCIO do pedido em
+// aberto nas instruções publicadas (v22): mudou lá, mude aqui (e vice-versa).
+// Fica no código como farewell/recovery/followup; a equipe não edita pela aba
+// Instruções.
+// ---------------------------------------------------------------------------
+const PENDING_FOLLOWUP_SYSTEM = [
+    "Você é a assistente virtual do escritório (Paraná Seguros) no WhatsApp.",
+    "O cliente tem um PEDIDO EM ABERTO — uma lista de documentos ou dados que a equipe (ou você) pediu — e parou de responder.",
+    "Quem lembra o cliente é o sistema: ele chama você de tempos em tempos, só enquanto o WhatsApp permite mensagem livre, e depois passa a conversa à equipe com o que falta.",
+    "Os fatos do pedido e a conversa vêm abaixo. Escolha UMA ação para esta rodada:",
+    "",
+    '- "nudge" (mandar um lembrete agora): ainda falta item OBRIGATÓRIO do pedido e o cliente não marcou um momento para mandar.',
+    '  Em "message", 1 a 3 frases curtas e calorosas, fáceis de responder, citando pelo nome SÓ o que ainda falta',
+    "  (pode agradecer em meia frase o que já chegou) e terminando com um convite simples (\"quando conseguir, é só mandar por aqui\").",
+    "  Pode oferecer ajuda se ele tiver dificuldade com algum item (\"se tiver dificuldade com algum, me avisa\").",
+    '  Não repita o texto de um lembrete anterior da conversa (as mensagens "[mensagem automática: cobrança automática do pedido em aberto]"): varie.',
+    '- "silent" (não mandar nada agora): o cliente marcou um momento que ainda não chegou ("mando à noite", "amanhã cedo",',
+    "  \"quando chegar em casa\"), avisou um impedimento (internado, viajando, luto) ou acabou de dizer que está providenciando.",
+    '- "handoff" (passar para a equipe agora): não falta item obrigatório (tudo chegou, o que falta o cliente disse que não tem,',
+    '  ou só faltam itens "(se tiver)"), o cliente disse que não consegue um item e precisa da equipe, pediu uma pessoa,',
+    '  ou fez uma pergunta que só a equipe responde. "message" vazio.',
+    "",
+    'Em "missing", os itens que AINDA faltam, com os nomes do pedido, separados por "; " (vazio se nada falta ou se não dá para saber).',
+    'Confira pela conversa o que já chegou: "[anexo: PDF]" sozinho não prova QUAL item é. Na dúvida, cite o que falta pelo nome e diga "se já mandou algum, me avisa".',
+    "",
+    "NUNCA no lembrete: despedida, \"posso ajudar em algo mais?\", dizer que vai encerrar ou que é a última mensagem, prazo,",
+    'promessa de ligação ou de resultado, as palavras "sistema", "automático" ou "janela", nome de alguém da equipe,',
+    "dados sensíveis (CPF, endereço), pedir algo fora do pedido, dizer que a equipe pediu para cobrar ou que a conversa voltou para você, falar em pedido em aberto, anotação ou fila. NUNCA peça, ofereça receber nem incentive o envio de senha",
+    "ou código (gov.br, Meu INSS, ZapSign). No máximo 1 emoji. Use o primeiro nome do cliente só se for um nome real de pessoa.",
+    'Pense no campo "rationale" (nunca enviado); "message" é só o texto pronto para o cliente ler.',
+].join("\n");
+
+const pendingFollowupSchema = {
+    type: "object",
+    additionalProperties: false,
+    properties: {
+        // Mesmo motivo do responseSchema (27/08/2026): sem onde pensar, o
+        // modelo delibera dentro do texto do cliente.
+        rationale: { type: "string", description: "Seu raciocínio (máx. 3 frases). NUNCA é enviado ao cliente." },
+        action: {
+            type: "string",
+            enum: ["nudge", "silent", "handoff"],
+            description: "nudge = mandar o lembrete agora; silent = não mandar nada nesta rodada; handoff = passar para a equipe agora.",
+        },
+        message: { type: "string", description: "Só com nudge: 1 a 3 frases prontas para o cliente. Vazio em silent e handoff." },
+        missing: { type: "string", description: "Itens que ainda faltam, com os nomes do pedido, separados por '; '. Vazio se nada falta ou não dá para saber." },
+        reason: { type: "string", description: "Motivo curto da decisão, para log." },
+    },
+    required: ["rationale", "action", "message", "missing", "reason"],
+};
+
+const PENDING_SOURCES = new Set(["devolver", "lista_atendente", "fluxo_ia"]);
+
+/**
+ * Normaliza o `pendingRequest` do CRM (fase de cobrança do cron):
+ * {text, source, at, flowName?, docsSinceOpened, attempt, windowClosesAt,
+ * lastClientAt, previousMissing?}. Sem texto → null (segue o modo antigo).
+ * Tudo vem DENTRO de pendingRequest: campo solto no topo do body se perderia
+ * no destructuring do index.js (armadilha do priorOutcome, 30/07).
+ */
+function parsePendingRequest(raw) {
+    if (!raw || typeof raw !== "object") return null;
+    const text = typeof raw.text === "string" ? raw.text.trim() : "";
+    if (!text) return null;
+    const iso = (v) => { const d = parseInstante(v); return d ? d.toISOString() : null; };
+    const attempt = contagem(raw.attempt);
+    const flowName = textoLinha(raw.flowName, 80);
+    const previousMissing = textoLinha(raw.previousMissing, 500);
+    return {
+        text: clipText(text, ATTENDANT_REQUEST_MAX_CHARS),
+        source: PENDING_SOURCES.has(raw.source) ? raw.source : null,
+        at: iso(raw.at),
+        flowName: flowName || null,
+        docsSinceOpened: contagem(raw.docsSinceOpened),
+        attempt: attempt && attempt >= 1 ? attempt : 1,
+        windowClosesAt: iso(raw.windowClosesAt),
+        lastClientAt: iso(raw.lastClientAt),
+        previousMissing: previousMissing || null,
+    };
+}
+
+/** Fatos da cobrança para o prompt (pedido + rodada), sem regra. */
+function buildPendingFacts(p, now = Date.now()) {
+    const pedido = renderAttendantRequest({
+        text: p.text, source: p.source, at: p.at, flowName: p.flowName,
+        docsSinceOpened: p.docsSinceOpened, nudges: Math.max(0, (p.attempt || 1) - 1),
+    }, now);
+    const linhas = [`- Esta seria a cobrança nº ${p.attempt || 1}.`];
+    const fecha = parseInstante(p.windowClosesAt);
+    if (fecha) {
+        const falta = fecha.getTime() - now;
+        linhas.push(`- A janela de mensagem livre do WhatsApp fecha em ${dataHoraBR(fecha)} (${falta > 0 ? `em cerca de ${duracaoTexto(falta)}` : "já fechou"}); antes disso, se ainda faltar item, a conversa passa para a equipe.`);
+    }
+    const cliente = quandoBR(p.lastClientAt, now);
+    if (cliente) linhas.push(`- Última mensagem do cliente: ${cliente}.`);
+    if (p.previousMissing) linhas.push(`- O que faltava na avaliação anterior: ${p.previousMissing}.`);
+    return `${pedido}\n\nCOBRANÇA (fatos do sistema):\n${linhas.join("\n")}`;
+}
+
+// Rede de segurança do texto da cobrança: o que as regras proíbem e que, se
+// sair, NÃO vai ao cliente (a rodada vira "silent"; nada de texto fixo no
+// lugar). Senha/código (decisão 6 do dono), despedida/encerramento e as
+// palavras que denunciam a automação.
+const PENDING_BLOCKED = [
+    [/\bsenha/i, "pede ou cita senha"],
+    [/c[óo]digo/i, "cita código"],
+    [/encerr/i, "fala em encerrar"],
+    [/[úu]ltima mensagem/i, "diz que é a última mensagem"],
+    [/\bsistema\b/i, "cita o sistema"],
+    [/autom[áa]tic/i, "cita mensagem automática"],
+    [/\bjanela\b/i, "cita a janela"],
+];
+
+const normTexto = (s) => String(s ?? "").toLowerCase().replace(/\s+/g, " ").trim();
+
+function problemaNaCobranca(message, lastOutText = "") {
+    if (looksLikeReasoning(message) || isJsonSkeleton(message)) return "raciocínio vazou na cobrança";
+    for (const [re, why] of PENDING_BLOCKED) if (re.test(message)) return `cobrança ${why}`;
+    if (lastOutText && normTexto(message) === normTexto(lastOutText)) return "cobrança idêntica à última mensagem enviada";
+    return null;
+}
+
+/**
+ * Resposta final da cobrança a partir da saída do modelo (pura, testável):
+ * { mode: "pending", action, message, missing, reason, leaked }. Texto
+ * descartado pela rede de segurança vira "silent" com leaked=true e o motivo
+ * no reason; message só existe com nudge.
+ */
+function finalizePendingDecision(out, { lastOutText = "" } = {}) {
+    const pedida = ["nudge", "silent", "handoff"].includes(out?.action) ? out.action : "silent";
+    let message = pedida === "nudge" ? sanitizeReply(out?.message) : "";
+    let reason = String(out?.reason ?? "").trim();
+    let leaked = false;
+    if (message) {
+        const problema = problemaNaCobranca(message, lastOutText);
+        if (problema) {
+            leaked = true;
+            message = "";
+            reason = `${reason ? `${reason} ` : ""}[texto descartado: ${problema}]`;
+        }
+    }
+    const action = pedida === "nudge" && !message ? "silent" : pedida;
+    const missing = String(out?.missing ?? "").replace(/\s*[\r\n]+\s*/g, "; ").replace(/\s{2,}/g, " ").trim();
+    return {
+        mode: "pending",
+        action,
+        message,
+        missing: clipText(missing, 500) || "",
+        reason: clipText(reason, 300) || "",
+        leaked,
+    };
+}
+
+// Velocidade da cobrança (revisão de 30/09/2026): o CRM espera ~35 s por ela
+// (antes 12 s) e o /reply, com raciocínio adaptativo sem teto, leva p90 ~20 s
+// só na IA — um terço das cobranças abortava no CRM e era paga mesmo assim.
+// A decisão é curta (nudge/silent/handoff + 1 a 3 frases): raciocínio no
+// esforço mais baixo e max_tokens menor; o campo `rationale` do schema segue
+// sendo onde o modelo pensa (ver 27/08). Haiku não aceita effort nem
+// adaptativo: orçamento mínimo (1024). Modelo fora das famílias conhecidas
+// fica como era (thinkingFor, 3000), para não arriscar um 400 com `effort`.
+const PENDING_LOW_EFFORT_RE = /claude-(?:opus|sonnet|fable)-(?:5|4-[6-9])/i;
+function pendingCallConfig(model) {
+    const m = String(model || "");
+    if (/haiku/i.test(m)) return { max_tokens: 2048, thinking: thinkingFor(m, 1024), effort: null };
+    if (PENDING_LOW_EFFORT_RE.test(m)) return { max_tokens: 1500, thinking: { type: "adaptive" }, effort: "low" };
+    return { max_tokens: 3000, thinking: thinkingFor(m), effort: null };
+}
+
+async function pendingFollowup({ contact, history, memory, state, pendingRequest: p }, { deadline, signal } = {}) {
+    const model = process.env.MODEL || "claude-sonnet-5";
+    const call = pendingCallConfig(model);
+    // Histórico no mesmo formato do /reply ([bot]/[atendente]/[mensagem
+    // automática: …]): a IA precisa ver quais lembretes já saíram.
+    const hist = pruneHistory(Array.isArray(history) ? history : [], 2500);
+    const transcript = hist
+        .map((h) => (h.role === "client" ? `Cliente: ${h.text}` : `${authorTag(h)} ${h.text}`))
+        .join("\n");
+    const ultimaSaida = [...hist].reverse().find((h) => h.role !== "client")?.text ?? "";
+
+    const { data: out, response } = await callClaudeStructured({
+        model,
+        // Ver pendingCallConfig: raciocínio curto (conta dentro do max_tokens).
+        max_tokens: call.max_tokens,
+        thinking: call.thinking,
+        system: PENDING_FOLLOWUP_SYSTEM,
+        output_config: {
+            format: { type: "json_schema", schema: pendingFollowupSchema },
+            ...(call.effort ? { effort: call.effort } : {}),
+        },
+        messages: [{
+            role: "user",
+            content:
+                `Nome do cliente: ${contact?.name ?? "não informado"}\n` +
+                (state ? `Etapa: ${state}\n` : "") +
+                (memory ? `Ficha: ${clipText(String(memory), 1500)}\n` : "") +
+                `\n${buildPendingFacts(p)}\n\n` +
+                `Conversa (mais recente por último):\n${transcript || "(sem histórico)"}`,
+        }],
+    }, "cobrança do pedido em aberto", (d) => {
+        // Texto que a rede de segurança descartaria → vale uma 2ª tentativa
+        // antes de desistir do lembrete desta rodada (só se couber no prazo
+        // do CRM: callClaudeStructured confere).
+        if (d?.action !== "nudge") return null;
+        const m = sanitizeReply(d?.message);
+        return m ? problemaNaCobranca(m, ultimaSaida) : null;
+    }, { deadline, signal });
+
+    const rationale = String(out?.rationale ?? "").trim();
+    if (rationale) console.log(`[BOT] cobrança — raciocínio: ${clipText(rationale, 300)}`);
+    return { ...finalizePendingDecision(out, { lastOutText: ultimaSaida }), usage: usageFrom(response, model) };
 }
 
 // ---------------------------------------------------------------------------
@@ -2797,4 +3497,13 @@ module.exports = {
     getStaticPrompt,
     // Motivo do aborto do /reply (prazo): o index.js cria, o callClaude reconhece.
     deadlineError,
+    // Funções puras exportadas para os testes (node --test, pasta test/):
+    // contrato das strings do bloco dinâmico, início do turno, sanitização
+    // do handoffAfterFlow e da cobrança do pedido em aberto.
+    renderConversationFacts, renderAttendantRequest, renderContractPending, renderReturnedByTeam,
+    buildDynamicContext, resolveTurnStart, notaUltimaSaida, rotuloAnexo, nomeDoAnexo,
+    quandoBR, dataHoraBR, citacao, sanitizeHandoffAfterFlow, sanitizeKeepRequest, pendingCallConfig,
+    parsePendingRequest, buildPendingFacts, finalizePendingDecision, getBrainPrompt,
+    responseSchema, pendingFollowupSchema, STATIC_SYSTEM_PROMPT, PENDING_FOLLOWUP_SYSTEM,
+    NOTA_ULTIMA_DO_ATENDENTE,
 };
