@@ -2991,7 +2991,7 @@ const recoverySchema = {
     additionalProperties: false,
 };
 
-async function recoveryMessage({ contact, history, memory, state, attempt = 1, maxAttempts = 3 }) {
+async function recoveryMessage({ contact, history, memory, state, attempt = 1, maxAttempts = 3, manual = false }) {
     const model = process.env.MODEL || "claude-sonnet-5";
 
     const transcript = (Array.isArray(history) ? history : [])
@@ -3000,12 +3000,17 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
         .join("\n");
 
     const isFinal = attempt >= maxAttempts;
-    const { data: out } = await callClaudeStructured({
+    const { data: out, response } = await callClaudeStructured({
         model,
         max_tokens: 350,
         system: [
             "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
-            "Um cliente COMEÇOU a triagem do Auxílio-Acidente mas parou de responder, e estamos tentando resgatá-lo.",
+            manual
+                // Recuperação MANUAL (21/10/2026): o atendente humano conduziu a
+                // conversa e a pôs em recuperação. A etapa da triagem do bot fica
+                // velha — o assunto andou com o atendente.
+                ? "Um ATENDENTE HUMANO estava conversando com este cliente, que parou de responder, e pediu que você o cobre. Retome EXATAMENTE do ponto em que a conversa parou nas ÚLTIMAS mensagens (o último pedido ou pergunta do Atendente) — ignore etapas antigas da triagem do bot, o assunto pode ter avançado. Fale como a mesma equipe, sem se apresentar de novo."
+                : "Um cliente COMEÇOU a triagem do Auxílio-Acidente mas parou de responder, e estamos tentando resgatá-lo.",
             `Esta é a tentativa ${attempt} de ${maxAttempts}.`,
             "",
             "Escreva UMA mensagem de provocação (2 a 4 frases, português do Brasil, tom caloroso de WhatsApp, pode usar 1 emoji):",
@@ -3037,6 +3042,7 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
     return {
         message: String(out.message ?? "").trim(),
         pending: String(out.pending ?? "").trim(),
+        usage: usageFrom(response, model),
     };
 }
 

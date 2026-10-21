@@ -177,9 +177,9 @@ app.post("/recovery-message", async (req, res) => {
   if (!SECRET || req.headers["x-bot-secret"] !== SECRET) {
     return res.status(403).json({ error: "forbidden" });
   }
-  const { contact, history, memory, state, attempt, maxAttempts } = req.body || {};
+  const { contact, history, memory, state, attempt, maxAttempts, manual } = req.body || {};
   try {
-    const out = await recoveryMessage({ contact, history, memory, state, attempt, maxAttempts });
+    const out = await recoveryMessage({ contact, history, memory, state, attempt, maxAttempts, manual: manual === true });
     console.log(`[BOT] recovery ${contact?.name ?? "?"} (tentativa ${attempt ?? 1}): ${out.message.slice(0, 80)}...`);
     res.json(out);
   } catch (err) {
