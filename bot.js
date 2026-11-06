@@ -868,7 +868,7 @@ Pode me mandar por aqui mesmo, na ordem que preferir."
      contornando_objecao_1 nem _2), faça UMA última provocação comercial
      (ver ENCERRAMENTO CONTEXTUAL, item 2) com state="contornando_objecao_1".
    - Se ele recusar de novo → action="disqualify", state="encerrando",
-     reply = despedida final. Ex.: "Sem problema, [nome]! A Paraná Seguros
+     reply = despedida final. Ex.: "Sem problema, [nome]! A Brasil Benefícios e Indenizações
      agradece o seu contato. Se mudar de ideia, estaremos à disposição por
      aqui. Tenha um ótimo dia! 😊"
 
@@ -1043,7 +1043,7 @@ lookup="status_processo", reply="". Ao receber o RESULTADO DA CONSULTA:
 3. Se o cliente disser que NÃO precisa de mais nada, encerre educadamente:
    action="resolve", closeCategory="perguntas", state="encerrando",
    reply = despedida final do ENCERRAMENTO CONTEXTUAL. Ex.:
-   "A Paraná Seguros agradece o seu contato, [nome]! Ficamos felizes em
+   "A Brasil Benefícios e Indenizações agradece o seu contato, [nome]! Ficamos felizes em
    ajudar. Qualquer coisa, é só chamar por aqui. Tenha um ótimo dia! 😊"
 
 ═══════════════════════════════════════
@@ -1086,7 +1086,7 @@ genérico igual para todos os casos:
 3. DESPEDIDA FINAL (sempre que o chat for encerrado de vez — resolve ou
    disqualify): finalize com uma mensagem de agradecimento em nome da
    empresa, adaptada ao que aconteceu na conversa. Padrão:
-   "A Paraná Seguros agradece o seu contato, [nome]! Foi um prazer te
+   "A Brasil Benefícios e Indenizações agradece o seu contato, [nome]! Foi um prazer te
    atender. Qualquer coisa, é só chamar por aqui. Tenha um ótimo dia! 😊"
    - Se foi lead que não quis seguir, acrescente que a porta fica aberta:
      "Se mudar de ideia, estaremos à disposição."
@@ -2607,7 +2607,7 @@ async function farewell({ contact, history, memory }) {
         model,
         max_tokens: 300,
         system: [
-            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "Você é o assistente de atendimento da Brasil Benefícios e Indenizações no WhatsApp.",
             "O cliente parou de responder há mais de 40 minutos e o atendimento será encerrado por inatividade.",
             "Escreva UMA mensagem curta (2 a 4 frases) de despedida, formal porém calorosa, em português do Brasil:",
             "- Mencione brevemente o assunto tratado (com base na conversa/ficha), sem repetir detalhes sensíveis (nunca cite CPF, endereço ou documentos).",
@@ -2685,7 +2685,7 @@ async function followupDecision({ contact, history, memory, state, pendingReques
         model,
         max_tokens: 250,
         system: [
-            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "Você é o assistente de atendimento da Brasil Benefícios e Indenizações no WhatsApp.",
             "Um cliente ficou mais de 30 minutos sem responder e a ÚLTIMA mensagem foi do bot.",
             "Olhando a conversa, decida se ainda faz sentido cutucar o cliente ou se ela já teve um FECHO NATURAL.",
             "",
@@ -2755,7 +2755,7 @@ async function followupDecision({ contact, history, memory, state, pendingReques
 // Instruções.
 // ---------------------------------------------------------------------------
 const PENDING_FOLLOWUP_SYSTEM = [
-    "Você é a assistente virtual do escritório (Paraná Seguros) no WhatsApp.",
+    "Você é a assistente virtual do escritório (Brasil Benefícios e Indenizações) no WhatsApp.",
     "O cliente tem um PEDIDO EM ABERTO — uma lista de documentos ou dados que a equipe (ou você) pediu — e parou de responder.",
     "Quem lembra o cliente é o sistema: ele chama você de tempos em tempos, só enquanto o WhatsApp permite mensagem livre, e depois passa a conversa à equipe com o que falta.",
     "Os fatos do pedido e a conversa vêm abaixo. Escolha UMA ação para esta rodada:",
@@ -3004,7 +3004,7 @@ async function recoveryMessage({ contact, history, memory, state, attempt = 1, m
         model,
         max_tokens: 350,
         system: [
-            "Você é o assistente de atendimento da Paraná Seguros no WhatsApp.",
+            "Você é o assistente de atendimento da Brasil Benefícios e Indenizações no WhatsApp.",
             manual
                 // Recuperação MANUAL (21/10/2026): o atendente humano conduziu a
                 // conversa e a pôs em recuperação. A etapa da triagem do bot fica

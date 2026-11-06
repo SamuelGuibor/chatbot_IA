@@ -1,4 +1,4 @@
-# Chatbot WhatsApp — DPVAT Paraná
+# Chatbot WhatsApp — Brasil Benefícios e Indenizações
 
 Microserviço de IA do atendimento por WhatsApp (mesmo padrão do `docx-converter`:
 Node + Express, deploy no Railway, 1 instância).

@@ -105,5 +105,6 @@ test("fallback: keepRequest no 'assinei' com a LISTA já mandada, marcadores de 
     assert.ok(p.includes('handoffReason="cliente pediu o acesso à Área do Cliente"'));
     assert.ok(p.includes("NUNCA informe senha de acesso"));
     assert.ok(!p.includes("segurosparana1"));
+    assert.ok(!p.includes("brasilbeneficios1"));
     assert.ok(!p.includes("senha padrão"));
 });
