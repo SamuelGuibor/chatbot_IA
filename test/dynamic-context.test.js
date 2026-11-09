@@ -234,7 +234,7 @@ test("fato voiceReplies: diz o estado nos dois sentidos (CRM antigo sem o campo 
     const on = bot.renderConversationFacts({ voiceReplies: true }, null, NOW);
     assert.match(on, /recebe as suas respostas em ÁUDIO/);
     const off = bot.renderConversationFacts({ voiceReplies: false }, null, NOW);
-    assert.match(off, /por TEXTO escrito \(o áudio está DESLIGADO/);
+    assert.match(off, /por TEXTO escrito\. Campo voiceReplies: desligado/);
     assert.doesNotMatch(off, /em ÁUDIO \(/);
     const antigo = bot.renderConversationFacts({ docsReceived: 1 }, null, NOW);
     assert.doesNotMatch(antigo, /TEXTO escrito|em ÁUDIO/);

@@ -1551,8 +1551,10 @@ function renderConversationFacts(facts, turn = null, now = Date.now()) {
     // desligado fazia a IA concluir pelo histórico ("eu disse que ia mandar
     // áudio") que já estava em áudio e devolver "manter" (09/11). CRM antigo
     // não manda o campo e a linha não sai.
-    if (f.voiceReplies === true) lines.push("- Este cliente recebe as suas respostas em ÁUDIO (o sistema transforma o seu texto em voz).");
-    else if (f.voiceReplies === false) lines.push("- Este cliente recebe as suas respostas por TEXTO escrito (o áudio está DESLIGADO; o que você escrever chega como texto, mesmo que antes tenha sido prometido áudio).");
+    // A linha cita o campo: "áudio DESLIGADO" sozinho a IA leu como defeito do
+    // sistema e transferiu o cliente em vez de ligar (09/11).
+    if (f.voiceReplies === true) lines.push("- Este cliente recebe as suas respostas em ÁUDIO (o sistema transforma o seu texto em voz). Campo voiceReplies: ligado.");
+    else if (f.voiceReplies === false) lines.push("- Este cliente recebe as suas respostas por TEXTO escrito. Campo voiceReplies: desligado (o que você escrever neste turno chega como texto, mesmo que antes tenha sido prometido áudio).");
 
     const blocos = [];
     if (lines.length) blocos.push(`ESTE ATENDIMENTO (fatos do sistema):\n${lines.join("\n")}`);
