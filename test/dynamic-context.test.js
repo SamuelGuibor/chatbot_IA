@@ -230,9 +230,12 @@ test("rótulo de anexo: '[anexo k de N: PDF \"nome\"]'", () => {
     assert.equal(bot.nomeDoAnexo("x".repeat(100)).length, 81);
 });
 
-test("fato voiceReplies: só aparece quando o cliente recebe em áudio", () => {
+test("fato voiceReplies: diz o estado nos dois sentidos (CRM antigo sem o campo = nada)", () => {
     const on = bot.renderConversationFacts({ voiceReplies: true }, null, NOW);
     assert.match(on, /recebe as suas respostas em ÁUDIO/);
     const off = bot.renderConversationFacts({ voiceReplies: false }, null, NOW);
-    assert.doesNotMatch(off, /ÁUDIO/);
+    assert.match(off, /por TEXTO escrito \(o áudio está DESLIGADO/);
+    assert.doesNotMatch(off, /em ÁUDIO \(/);
+    const antigo = bot.renderConversationFacts({ docsReceived: 1 }, null, NOW);
+    assert.doesNotMatch(antigo, /TEXTO escrito|em ÁUDIO/);
 });

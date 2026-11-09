@@ -1546,8 +1546,13 @@ function renderConversationFacts(facts, turn = null, now = Date.now()) {
     if (contrato) lines.push(contrato);
     if (f.recentAttendant) lines.push("- Houve mensagem de um atendente da equipe para este cliente nos últimos 7 dias.");
     // Respostas em áudio (08/11/2026): só o fato; como escrever para a voz e
-    // quando desligar ficam nas instruções.
+    // quando ligar/desligar ficam nas instruções. O estado vai SEMPRE (CRM
+    // novo manda true/false): só com a linha do "ligado", o silêncio no
+    // desligado fazia a IA concluir pelo histórico ("eu disse que ia mandar
+    // áudio") que já estava em áudio e devolver "manter" (09/11). CRM antigo
+    // não manda o campo e a linha não sai.
     if (f.voiceReplies === true) lines.push("- Este cliente recebe as suas respostas em ÁUDIO (o sistema transforma o seu texto em voz).");
+    else if (f.voiceReplies === false) lines.push("- Este cliente recebe as suas respostas por TEXTO escrito (o áudio está DESLIGADO; o que você escrever chega como texto, mesmo que antes tenha sido prometido áudio).");
 
     const blocos = [];
     if (lines.length) blocos.push(`ESTE ATENDIMENTO (fatos do sistema):\n${lines.join("\n")}`);
