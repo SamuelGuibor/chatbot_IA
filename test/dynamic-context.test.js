@@ -229,3 +229,10 @@ test("rótulo de anexo: '[anexo k de N: PDF \"nome\"]'", () => {
     assert.equal(bot.rotuloAnexo(1, 2, false, 'whatsapp/abc/Carta "nova".jpg'), '[anexo 1 de 2: imagem "Carta nova.jpg"]');
     assert.equal(bot.nomeDoAnexo("x".repeat(100)).length, 81);
 });
+
+test("fato voiceReplies: só aparece quando o cliente recebe em áudio", () => {
+    const on = bot.renderConversationFacts({ voiceReplies: true }, null, NOW);
+    assert.match(on, /recebe as suas respostas em ÁUDIO/);
+    const off = bot.renderConversationFacts({ voiceReplies: false }, null, NOW);
+    assert.doesNotMatch(off, /ÁUDIO/);
+});

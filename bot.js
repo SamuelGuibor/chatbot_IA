@@ -475,6 +475,15 @@ const responseSchema = {
             items: { type: "string" },
             description: "IDs das LIÇÕES APRENDIDAS (ex.: 'R3') que INFLUENCIARAM esta resposta — mudaram o que você diria ou como diria. [] quando nenhuma pesou. Cite só as que de fato usou; não liste por precaução.",
         },
+        // 08/11/2026 (respostas em ÁUDIO): o CRM grava no contato e passa a
+        // mandar as mensagens como voz (ElevenLabs). Campo novo de schema = 3
+        // lugares: instruções, aqui e BotDecision do bot.ts. CRM antigo ignora.
+        voiceReplies: {
+            type: "string",
+            enum: ["ligar", "desligar", "manter"],
+            // Neutra de propósito: QUANDO ligar/desligar é das instruções.
+            description: "Formato das próximas mensagens ao cliente: \"ligar\" = passar a responder por ÁUDIO; \"desligar\" = voltar a responder por texto; \"manter\" = não mudar nada. Siga as instruções para saber quando ligar ou desligar; na dúvida, \"manter\".",
+        },
         silent: {
             type: "boolean",
             description: "true SOMENTE quando NÃO enviar mensagem é deliberadamente o correto: (a) o cliente só agradeceu/se despediu DEPOIS que você já se despediu → use action=resolve ou disqualify; (b) o cliente mandou só um 'ok', '👍', 'blz' ou reação confirmando algo que JÁ foi combinado (ex.: 'pode mandar quando voltar' → 'ok') e não há nada novo a dizer → use action=continue (a conversa segue aberta aguardando). NUNCA use true quando o cliente perguntou algo, mandou informação/documento nova ou está esperando resposta. Quando silent=true, deixe reply vazio.",
@@ -484,7 +493,7 @@ const responseSchema = {
         "rationale",
         "reply", "replies", "action", "flowName", "closeCategory", "handoffReason", "handoffAfterFlow", "keepRequest",
         "lookup", "memory", "state", "intent", "emotion", "understood", "confidence", "optOut",
-        "appliedRules", "silent",
+        "appliedRules", "voiceReplies", "silent",
     ],
 };
 
@@ -1536,6 +1545,9 @@ function renderConversationFacts(facts, turn = null, now = Date.now()) {
     const contrato = renderContractPending(f.contractPending);
     if (contrato) lines.push(contrato);
     if (f.recentAttendant) lines.push("- Houve mensagem de um atendente da equipe para este cliente nos últimos 7 dias.");
+    // Respostas em áudio (08/11/2026): só o fato; como escrever para a voz e
+    // quando desligar ficam nas instruções.
+    if (f.voiceReplies === true) lines.push("- Este cliente recebe as suas respostas em ÁUDIO (o sistema transforma o seu texto em voz).");
 
     const blocos = [];
     if (lines.length) blocos.push(`ESTE ATENDIMENTO (fatos do sistema):\n${lines.join("\n")}`);
@@ -2471,6 +2483,8 @@ async function decide({
         // (ex.: agradecimento pós-despedida). Sem esta flag, desfecho terminal
         // com reply vazio é tratado como erro pelo app Next (fallback + log).
         silent: Boolean(parsed.silent),
+        // Respostas em áudio: ligar/desligar/manter (o CRM aplica no contato).
+        voiceReplies: ["ligar", "desligar"].includes(parsed.voiceReplies) ? parsed.voiceReplies : "manter",
         // Transcrições dos áudios do lote ({ id, transcript }) — o CRM persiste
         // em WhatsAppMessage.transcript para o conteúdo sobreviver no histórico
         // dos próximos turnos (e o botão "transcrever" não pagar IA de novo).

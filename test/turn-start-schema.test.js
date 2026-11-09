@@ -108,3 +108,10 @@ test("fallback: keepRequest no 'assinei' com a LISTA já mandada, marcadores de 
     assert.ok(!p.includes("brasilbeneficios1"));
     assert.ok(!p.includes("senha padrão"));
 });
+
+test("responseSchema tem voiceReplies (ligar/desligar/manter) e obrigatório", () => {
+    const f = bot.responseSchema.properties.voiceReplies;
+    assert.equal(f.type, "string");
+    assert.deepEqual(f.enum, ["ligar", "desligar", "manter"]);
+    assert.ok(bot.responseSchema.required.includes("voiceReplies"));
+});
