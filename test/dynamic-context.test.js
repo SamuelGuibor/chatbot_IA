@@ -239,3 +239,10 @@ test("fato voiceReplies: diz o estado nos dois sentidos (CRM antigo sem o campo 
     const antigo = bot.renderConversationFacts({ docsReceived: 1 }, null, NOW);
     assert.doesNotMatch(antigo, /TEXTO escrito|em ÁUDIO/);
 });
+
+test("aceite de termos pendente (T-B40K0): linha com tempo e envios; sem campo, nada", () => {
+    const out = bot.renderConversationFacts({ termsPending: { sentAt: "2026-09-30T12:50:00Z", sends: 2 } }, null, NOW);
+    assert.ok(out.includes("- O formulário de AUTORIZAÇÃO (aceite dos termos, botão no WhatsApp) foi enviado há 15 min (enviado 2 vezes) e o cliente AINDA NÃO autorizou."));
+    assert.ok(out.includes("Campo termsPending."));
+    assert.equal(bot.renderConversationFacts({ termsPending: null }, null, NOW), "");
+});

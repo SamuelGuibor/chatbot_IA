@@ -1519,6 +1519,16 @@ function renderContractPending(cp) {
  * `turn` = {docs, opened}: foto/PDF deste lote que chegaram ao micro e quantos
  * foram abertos e anexados à mensagem (calculado em decide).
  */
+/** Linha do fato termsPending ({ sentAt, sends }) ou null. */
+function renderTermsPending(t, now = Date.now()) {
+    if (!t || typeof t !== "object") return null;
+    const sentMs = Date.parse(t.sentAt);
+    const min = Number.isFinite(sentMs) ? Math.max(0, Math.round((now - sentMs) / 60000)) : null;
+    const quando = min === null ? "" : min < 1 ? " agora há pouco" : min < 120 ? ` há ${min} min` : ` há ${Math.round(min / 60)} h`;
+    const envios = Number.isInteger(t.sends) && t.sends > 1 ? ` (enviado ${t.sends} vezes)` : "";
+    return `- O formulário de AUTORIZAÇÃO (aceite dos termos, botão no WhatsApp) foi enviado${quando}${envios} e o cliente AINDA NÃO autorizou. Sem essa autorização o atendimento não segue para a equipe. Campo termsPending.`;
+}
+
 function renderConversationFacts(facts, turn = null, now = Date.now()) {
     const f = facts && typeof facts === "object" ? facts : {};
     const t = { docs: contagem(turn?.docs) ?? 0, opened: contagem(turn?.opened) ?? 0 };
@@ -1555,6 +1565,12 @@ function renderConversationFacts(facts, turn = null, now = Date.now()) {
     // sistema e transferiu o cliente em vez de ligar (09/11).
     if (f.voiceReplies === true) lines.push("- Este cliente recebe as suas respostas em ÁUDIO (o sistema transforma o seu texto em voz). Campo voiceReplies: ligado.");
     else if (f.voiceReplies === false) lines.push("- Este cliente recebe as suas respostas por TEXTO escrito. Campo voiceReplies: desligado (o que você escrever neste turno chega como texto, mesmo que antes tenha sido prometido áudio).");
+    // Aceite de termos (T-B40K0, CRM de 13/11/2026): o sistema mandou o
+    // formulário de AUTORIZAÇÃO (botão no WhatsApp) e o cliente ainda não
+    // autorizou. Só o fato — lembrar do botão e o que dizer ficam nas
+    // instruções. CRM antigo não manda o campo e a linha não sai.
+    const termos = renderTermsPending(f.termsPending, now);
+    if (termos) lines.push(termos);
 
     const blocos = [];
     if (lines.length) blocos.push(`ESTE ATENDIMENTO (fatos do sistema):\n${lines.join("\n")}`);
